@@ -1,17 +1,21 @@
-# Stock API Service — Build Plan
+# Stock API Service — Design Notes
 
-Self-hosted replacement for the RapidAPI / Yahoo Finance dependency used by the
-ESP8266 stock ticker. Hosted on rozakos.eu, built with Python + FastAPI + yfinance.
+Self-hosted replacement for the RapidAPI / Yahoo Finance dependency used by
+the ESP8266 stock ticker. Hosted on rozakos.eu. Python + FastAPI + yfinance,
+with a Postgres-backed 1-minute history archive on the LAN.
+
+For end-user setup and API reference, see `README.md`. This file is the
+design rationale and the build/operations log for future-me.
 
 ---
 
 ## Why this exists
 
-The ESP8266 firmware currently calls `yahoo-finance15.p.rapidapi.com` with a
-RapidAPI key. The free tier has a hard monthly call cap that runs out.  
-Goal: run our own thin proxy on rozakos.eu so the device calls **our** endpoint
-instead. No external API key required after this — yfinance scrapes Yahoo Finance
-directly from the server side.
+The ESP8266 firmware used to call `yahoo-finance15.p.rapidapi.com` with a
+RapidAPI key. The free tier has a monthly call cap that we kept blowing
+through. The fix: run our own thin proxy on rozakos.eu so the device calls
+**our** endpoint. yfinance scrapes Yahoo Finance directly from the server,
+so no third-party key is required.
 
 ---
 
@@ -20,13 +24,20 @@ directly from the server side.
 | Layer | Choice | Reason |
 |---|---|---|
 | Language | Python 3.11+ | yfinance is Python-native |
-| Framework | FastAPI | async, automatic OpenAPI docs, tiny footprint |
+| Framework | FastAPI 0.115 | async, automatic OpenAPI docs, tiny footprint |
 | Data source | yfinance 0.2.x | stable Yahoo Finance scraper, no key needed |
 | Server | uvicorn (ASGI) | pairs with FastAPI, low memory |
-| Reverse proxy | nginx | TLS termination, already likely on rozakos.eu |
-| TLS | Let's Encrypt / certbot | free, auto-renews |
-| Process manager | systemd | keeps the service alive across reboots |
-| Python env | venv | no Docker needed for something this small |
+| History store | Postgres (unraid LAN box) | tiny table, persistent across restarts |
+| DB driver | psycopg 3 + psycopg_pool | sync + simple |
+| Edge | Cloudflare Tunnel (`cloudflared`) | already in front of rozakos.eu |
+| TLS | Cloudflare | nothing to do on our side |
+| Process manager | systemd | survives reboots |
+| Python env | venv | no Docker needed |
+
+Caddy is also installed on the box (historical reverse proxy). Cloudflare
+Tunnel now routes paths directly to localhost ports, so Caddy is no longer
+in the request path for this service. `nginx.conf.snippet` is kept for
+posterity in case the edge ever changes.
 
 ---
 
@@ -34,83 +45,69 @@ directly from the server side.
 
 ```
 /home/rozakos/stock-api/
-├── AGENTS.md          ← this file
-├── main.py            ← FastAPI app (single file, ~80 lines)
-├── requirements.txt   ← pinned deps
-├── .env               ← API_SECRET=<token>  (never commit)
-├── .env.example       ← API_SECRET=changeme
-├── stock-api.service  ← systemd unit file (copy to /etc/systemd/system/)
-└── nginx.conf.snippet ← nginx server block to paste into sites-available
+├── README.md            ← user-facing setup + API ref
+├── AGENTS.md            ← this file (design notes)
+├── main.py              ← FastAPI app
+├── test_client.py       ← mimics what the ESP8266 does (sparkline mode too)
+├── requirements.txt
+├── .env                 ← API_SECRET, DATABASE_URL, ...  (never commit)
+├── .env.example
+├── .gitignore
+├── stock-api.service    ← systemd unit (copy to /etc/systemd/system/)
+├── nginx.conf.snippet   ← legacy / reference only
+└── symbols.cache.json   ← persisted universe (gitignored, self-heals)
 ```
 
-No subdirectory nesting — the whole service is small enough to live flat.
+Flat layout — the service is small enough not to need subdirectories.
 
 ---
 
 ## API design
 
-Base URL: `https://rozakos.eu/stocks/api/v1`  
-(Uses a path prefix so it can coexist with other things on the same domain.)
+Base URL: `https://rozakos.eu/stocks/api/v1`.
 
-### GET `/stocks/api/v1/stock/{symbol}`
+### `GET /stock/{symbol}` — live quote
 
-Returns the last 5 trading days of closing prices for a single ticker.
+The endpoint the ESP8266 hits every poll. Bearer auth. Returns 5 most recent
+daily closes plus pre-computed deltas so the device does no arithmetic.
 
-**Auth:** `Authorization: Bearer <secret>` header.  
-If `API_SECRET` env var is empty the check is skipped (useful for LAN-only).
+Response shape and error codes are documented in `README.md`. Two non-obvious
+behaviors worth knowing:
 
-**Path param:** `symbol` — any Yahoo Finance symbol.  
-Examples: `AMD`, `NVDA`, `BTC-USD`, `TSM`
+- **Stale fallback** — if yfinance throws (network blip, Yahoo rate limit)
+  and we have a previous response cached for this symbol, we return it with
+  `"stale": true` rather than 502. The device displays the last known price
+  instead of blanking out.
+- **Allowlist validation** — unknown symbols 400 *before* yfinance is
+  touched, so a leaked token can't be used to spam Yahoo with garbage
+  tickers and grow the in-memory cache without bound.
 
-**Response 200:**
-```json
-{
-  "symbol": "AMD",
-  "closes": [148.32, 151.10, 149.88, 153.44, 155.20],
-  "last":   155.20,
-  "prev":   153.44,
-  "change": 1.76,
-  "change_pct": 1.15,
-  "cached": false
-}
-```
+### `GET /history/{symbol}?days=N` — minute-bar history
 
-- `closes` — oldest → newest, up to 5 entries, all valid (no nulls)
-- `last` / `prev` — the two most recent valid closes
-- `change` / `change_pct` — pre-computed so the ESP8266 doesn't have to
-- `cached` — `true` if this response came from the in-memory cache
+Returns the time-series of minute-resolution closes we've recorded for the
+symbol. Only available for symbols in the hot LRU set (see "History
+strategy" below). 503 if no `DATABASE_URL` is configured.
 
-**Response 404:** symbol not found or yfinance returned empty data  
-**Response 401:** wrong or missing bearer token  
-**Response 502:** yfinance threw an exception (upstream problem)
+### `GET /health`
 
-### GET `/stocks/api/v1/health`
+No auth. Exposes:
+- `universe_size`, `universe_refreshed_at` — symbol allowlist state
+- `cached_symbols` — what's currently in the live-quote cache
+- `history_enabled`, `hot_symbols`, `hot_max`, `tick_seconds`
+- `market_open` — am I currently in US RTH?
 
-No auth required. Returns `{"status": "ok", "cached_symbols": ["AMD", "NVDA"]}`.  
-Used by nginx or uptime monitors to confirm the service is alive.
+### `GET /docs`
 
-### GET `/stocks/api/v1/docs`  *(FastAPI built-in)*
-
-Auto-generated OpenAPI UI. Only reachable from localhost in production
-(nginx blocks it externally — see nginx config section).
+FastAPI auto-generated UI. Reachable on 127.0.0.1 only. Cloudflare Tunnel
+returns 404 for `^/stocks/api/v1/(docs|openapi\.json|redoc).*` externally.
 
 ---
 
 ## Caching strategy
 
-In-memory dict keyed by uppercase symbol. Each entry stores the response
-payload and a `datetime` timestamp.
+### Live-quote cache (in-memory)
 
-- **TTL: 10 minutes** (600 s). Stock data on a home ticker cycling every 30 s
-  doesn't need to be fresher than that.
-- Cache is process-local — it resets on service restart. That's fine; there's
-  no persistence requirement.
-- No Redis, no SQLite. Three tickers × one tiny dict entry each = negligible RAM.
-
-If yfinance fails (network blip, Yahoo rate-limit), the service returns the
-**stale cache entry** with `"cached": true` and a `"stale": true` flag rather
-than a 502. This keeps the ESP8266 display showing the last known price instead
-of blanking out.
+Process-local dict, `{ "AMD": {"ts": datetime, "data": {...}} }`, TTL 10 min.
 
 ```
 request in
@@ -122,176 +119,173 @@ request in
           └─ no entry at all?   → 502
 ```
 
----
+No Redis, no SQLite for this layer. Three home tickers + 8 hot symbols ×
+tiny dicts = negligible RAM.
 
-## Implementation steps
+### Symbol universe allowlist
 
-### Step 1 — create the venv and install deps
+On startup, load the last fetched universe from `symbols.cache.json`. A
+background task refreshes every 24 h from:
 
-```bash
-cd /home/rozakos/stock-api
-python3 -m venv .venv
-source .venv/bin/activate
-pip install fastapi uvicorn[standard] yfinance python-dotenv
-pip freeze > requirements.txt
+- `https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt`
+- `https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt`
+
+These are pipe-delimited files with a "Test Issue" column — we filter those
+out. Combined set is ~12.6 k tickers. A `set[str]` of that size is ~1–2 MB
+of RAM; trivial.
+
+Failure mode: if both fetch *and* the disk cache fail (cold start, network
+down), we **fail open** and accept any symbol. Otherwise we enforce against
+the in-memory set even if it's a few days stale. The threat model is a
+leaked bearer being used to spam unknown tickers, not a 30-minute
+NASDAQ Trader outage; staleness is fine.
+
+`EXTRA_SYMBOLS` env var unions in tickers that aren't in those files —
+currently `BTC-USD`. When we add a proper crypto/indices source later, this
+list shrinks.
+
+### History store (Postgres)
+
+Schema:
+
+```sql
+CREATE TABLE prices (
+  symbol TEXT NOT NULL,
+  ts     TIMESTAMPTZ NOT NULL,
+  last   DOUBLE PRECISION NOT NULL,
+  PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX prices_symbol_ts_idx ON prices (symbol, ts DESC);
 ```
 
-### Step 2 — write main.py
+Hot symbols are tracked in-memory as an LRU `OrderedDict` capped at 8
+(`HISTORY_MAX_HOT`). Each `/stock/{X}` hit moves `X` to the front; the
+oldest entry is evicted when the cap is exceeded. On startup the LRU is
+seeded from `SELECT symbol FROM prices GROUP BY symbol ORDER BY MAX(ts)
+ASC LIMIT 8` so a restart preserves the most-recently-active tickers.
 
-Key sections:
+A background task ticks every 60 s. If `_is_market_open()` returns true
+(US weekday + 09:30 ≤ ET < 16:00), it fetches
+`yf.Ticker(sym).history(period="1d", interval="1m")` for each hot symbol
+and bulk-inserts the resulting bars with `ON CONFLICT DO NOTHING`. The
+same tick prunes rows older than 30 days.
 
-1. **Config** — load `API_SECRET` from `.env` via `python-dotenv`
-2. **Cache** — `_cache: dict[str, dict]` with `ts` and `data` keys
-3. **`_fetch(symbol)`** — calls `yf.Ticker(symbol).history(period="5d", interval="1d")`,
-   extracts the `Close` column, drops NaNs, returns the list of floats
-4. **`GET /stock/{symbol}`** — auth check → cache lookup → fetch → cache store → return
-5. **`GET /health`** — no auth, returns status + cached symbol list
+Why fetch a full day on every tick instead of just the latest bar:
+- Idempotent — a missed tick (service restart, transient network blip)
+  is self-healing on the next fire.
+- Aligned timestamps — we store Yahoo's actual minute-bar timestamps
+  rather than "whenever the cron fired", so the series is regular even
+  across tick jitter.
+- Tiny — ~400 rows in a payload yfinance is already returning, dedup'd
+  at the PK; the wasted bandwidth is negligible at home scale.
 
-### Step 3 — write the .env file
+Yahoo load: 8 calls/min during RTH = ~0.13 req/s. Well under any anecdotal
+yfinance rate-limit threshold.
 
-```
-API_SECRET=pick-something-random-here
-```
+### Why Postgres on the LAN and not local SQLite
 
-Generate a token: `python3 -c "import secrets; print(secrets.token_hex(24))"`
-
-### Step 4 — write the systemd unit
-
-File: `stock-api.service` (also saved in the repo root for reference).
-
-```ini
-[Unit]
-Description=Stock API (yfinance proxy)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=rozakos
-WorkingDirectory=/home/rozakos/stock-api
-EnvironmentFile=/home/rozakos/stock-api/.env
-ExecStart=/home/rozakos/stock-api/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8001
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Install and enable:
-```bash
-sudo cp stock-api.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now stock-api
-sudo systemctl status stock-api
-```
-
-### Step 5 — nginx config
-
-Add a `location` block inside the existing `rozakos.eu` server block.  
-The snippet is saved as `nginx.conf.snippet` in the repo root.
-
-```nginx
-# Stock API proxy
-location /stocks/api/ {
-    proxy_pass         http://127.0.0.1:8001/stocks/api/;
-    proxy_set_header   Host $host;
-    proxy_set_header   X-Real-IP $remote_addr;
-    proxy_read_timeout 15s;
-}
-
-# Block external access to the auto-docs UI
-location /stocks/api/v1/docs {
-    allow 127.0.0.1;
-    deny  all;
-}
-location /stocks/api/v1/redoc {
-    allow 127.0.0.1;
-    deny  all;
-}
-location /stocks/api/v1/openapi.json {
-    allow 127.0.0.1;
-    deny  all;
-}
-```
-
-After editing, test and reload:
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-TLS is handled by the existing certbot cert for rozakos.eu — no extra steps if
-the cert already covers the domain.
-
-### Step 6 — smoke test from the server
-
-```bash
-# health (no auth)
-curl https://rozakos.eu/stocks/api/v1/health
-
-# real ticker (with auth)
-curl -H "Authorization: Bearer <your-secret>" \
-     https://rozakos.eu/stocks/api/v1/stock/AMD
-```
-
-Expected: JSON with `closes`, `last`, `prev`, `change`, `change_pct`.
+The unraid box already runs Postgres and is the natural place to put
+persistent data on this network. If the LAN box is unreachable at startup,
+history simply disables itself (`_pool = None`) and the live quote endpoint
+runs untouched. `/history` returns 503 in that mode.
 
 ---
 
-## Security notes
+## Edge routing
 
-- The bearer token prevents the endpoint from being an open relay for anyone
-  who stumbles onto the URL. It is not cryptographic auth — don't reuse a
-  password you care about.
-- yfinance talks to Yahoo Finance over HTTPS from the server. The ESP8266 talks
-  to rozakos.eu over HTTPS. No credentials touch the ESP8266 firmware image
-  except the bearer token (which lives in LittleFS, not compiled-in).
-- The `/docs` UI is blocked externally so the API surface isn't advertised.
-- Rate limiting is not needed for personal use (3 tickers × every 30 s = 6 req/min).
-  If you ever open this to more devices, add `slowapi` (FastAPI rate-limit library).
+Cloudflare → cloudflared tunnel → `127.0.0.1:8001`. Tunnel config at
+`/etc/cloudflared/config.yml`:
+
+```yaml
+ingress:
+  - hostname: rozakos.eu
+    path: ^/stocks/api/v1/(docs|openapi\.json|redoc).*
+    service: http_status:404
+  - hostname: rozakos.eu
+    path: ^/stocks/api/.*
+    service: http://127.0.0.1:8001
+  - hostname: rozakos.eu
+    service: http://127.0.0.1:3000   # the existing Next.js app on rozakos.eu
+  - service: http_status:404
+```
+
+`www.rozakos.eu` has the same rule set (duplicated in the actual config).
+
+Cloudflare's default bot-fight mode 403s requests with no/default User-Agent.
+Any non-empty UA passes; the firmware and `test_client.py` both set
+`User-Agent: stock-ticker/1.0` for this reason.
 
 ---
 
-## Resume checklist
+## ESP8266 firmware changes
 
-- [x] `main.py` written
-- [x] `requirements.txt` pinned
-- [x] `.env.example` created
-- [x] `stock-api.service` systemd unit written
-- [x] `nginx.conf.snippet` written
-- [ ] On the server: create venv and install deps
-  ```bash
-  python3 -m venv .venv
-  source .venv/bin/activate
-  pip install -r requirements.txt
-  ```
-- [ ] Create `.env` with a real secret
-  ```bash
-  cp .env.example .env
-  python3 -c "import secrets; print(secrets.token_hex(24))"
-  # paste output into .env as API_SECRET
-  ```
-- [ ] Test locally on the server
-  ```bash
-  source .venv/bin/activate
-  uvicorn main:app --reload --port 8001
-  curl http://127.0.0.1:8001/stocks/api/v1/health
-  curl -H "Authorization: Bearer <secret>" http://127.0.0.1:8001/stocks/api/v1/stock/AMD
-  ```
-- [ ] Install and start the systemd service
-  ```bash
-  sudo cp stock-api.service /etc/systemd/system/
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now stock-api
-  sudo systemctl status stock-api
-  ```
-- [ ] Add nginx snippet and reload
-  ```bash
-  # paste nginx.conf.snippet into /etc/nginx/sites-available/rozakos.eu
-  sudo nginx -t && sudo systemctl reload nginx
-  ```
-- [ ] Smoke test through the public URL
-  ```bash
-  curl https://rozakos.eu/stocks/api/v1/health
-  curl -H "Authorization: Bearer <secret>" https://rozakos.eu/stocks/api/v1/stock/AMD
-  ```
+Only `fetchHistoricalPrices()` (or wherever the current RapidAPI call lives)
+needs to change. Summary for the firmware patch:
+
+1. Host: `rozakos.eu`. Path: `/stocks/api/v1/stock/<SYMBOL>`.
+2. Drop the `x-rapidapi-key` and `x-rapidapi-host` headers.
+3. Add `Authorization: Bearer <token>`.
+4. Add `http.setUserAgent("stock-ticker/1.0")` — without this, Cloudflare
+   bot-fight returns 403. The default `ESP8266HTTPClient` UA gets blocked.
+5. JSON parsing simplifies: `doc["closes"]` is a flat array, no multi-schema
+   guessing required.
+6. `doc["change"]` and `doc["change_pct"]` come pre-computed — remove
+   the on-device calculation so the screen value matches the server.
+7. `SETTINGS_FILE` grows a `bearerToken` field so it can be set via the web
+   UI the same way `apiKey` was.
+
+Optional: the `/history/{symbol}?days=N` endpoint is available behind the
+same bearer if we want to render a sparkline on the OLED. Up to 30 days,
+minute-resolution.
+
+The firmware can cycle through any number of symbols, but only the 8
+most-recently-requested get their 1-minute history recorded. That's a
+non-issue at 3-ish tickers.
+
+---
+
+## Operations cheat sheet
+
+```bash
+# logs
+journalctl -u stock-api -f
+
+# state
+curl https://rozakos.eu/stocks/api/v1/health | jq
+
+# restart
+sudo systemctl restart stock-api
+
+# rotate token
+python3 -c "import secrets; print(secrets.token_hex(24))"
+# update .env, then restart, then update LittleFS on the device
+
+# inspect history
+psql "$DATABASE_URL" -c "SELECT symbol, count(*), min(ts), max(ts) FROM prices GROUP BY symbol"
+
+# force a one-shot tick for testing
+.venv/bin/python -c "import main; from psycopg_pool import ConnectionPool; \
+  main._pool = ConnectionPool(main.DATABASE_URL, open=True); \
+  main._mark_hot('AMD'); main._tick_history_sync()"
+```
+
+---
+
+## What's intentionally not built
+
+- **App-layer rate limiting.** The 10-min cache caps real upstream load to
+  1 call per symbol per 10 min, and the allowlist caps the symbol space.
+  At home scale this is enough. Reach for `slowapi` if it ever opens up.
+- **Holiday calendar.** The history tick fires Mon–Fri 09:30–16:00 ET. On
+  US market holidays we'll record bars yfinance returns from a closed
+  market (usually flat / nulls). Few rows; not worth `pandas_market_calendars`.
+- **Crypto / indices / FX in the universe.** `EXTRA_SYMBOLS` covers what
+  we need today. Adding CoinGecko-style sources is straightforward when we
+  want them.
+- **Per-client auth.** One shared bearer. Treat it as rotatable, not secret.
+
+---
+
+## Status
+
+Deployed. ESP8266 firmware patch pending in the separate firmware repo.
