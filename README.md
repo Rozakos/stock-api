@@ -21,6 +21,9 @@ ESP8266 ──HTTPS──▶ Cloudflare ──tunnel──▶ stock-api (FastAPI
 - **1-minute history** — for the 8 most-recently-requested symbols (LRU),
   one row per minute bar is written to Postgres during US regular trading
   hours, retained 30 days. Queryable via `GET /history/{symbol}?days=N`.
+- **Range history** — `GET /history/{symbol}?range=…` returns longer windows
+  (up to `max`) fetched live from yfinance at fixed period+interval pairs,
+  server-cached with TTLs tuned per range.
 
 ## API
 
@@ -50,10 +53,40 @@ response).
 Status codes: `400` unknown symbol, `401` bad/missing bearer, `502` upstream
 Yahoo failure with no prior cache.
 
-### `GET /history/{symbol}?days=N`
+### `GET /history/{symbol}` — two modes
 
-`N` between 1 and 30. Returns minute-resolution points for symbols that have
-been requested recently enough to be in the hot set.
+**`?range=…`** (recommended) — served live from yfinance and cached
+server-side. One of `1d`, `5d`, `1w`, `1mo`, `6mo`, `1y`, `max`. The server
+maps each range to a fixed period+interval pair:
+
+| `range` | yfinance period | yfinance interval | `interval` field | cache TTL |
+|---|---|---|---|---|
+| `1d`  | `1d`  | `5m`  | `intraday` | 60 s |
+| `5d`  | `5d`  | `30m` | `intraday` | 5 min |
+| `1w`  | `7d`  | `1h`  | `intraday` | 5 min |
+| `1mo` | `1mo` | `1d`  | `daily`    | 1 h |
+| `6mo` | `6mo` | `1d`  | `daily`    | 1 h |
+| `1y`  | `1y`  | `1d`  | `daily`    | 1 h |
+| `max` | `max` | `1wk` | `daily`    | 1 h |
+
+```json
+{
+  "symbol": "AMD",
+  "range": "1mo",
+  "interval": "daily",
+  "count": 22,
+  "points": [{"ts": 1776312000, "last": 278.26}, ...]
+}
+```
+
+`ts` is **epoch seconds**. `interval` tells the client whether to format
+the X axis as time-of-day (`intraday`) or as dates (`daily`).
+
+Invalid `range` values return `422` (FastAPI validation).
+
+**`?days=N`** (legacy, 1 ≤ N ≤ 30) — served from the Postgres minute-bar
+archive. Returned only for symbols currently in the hot LRU. Kept for the
+in-field ESP8266 firmware until it migrates to `range=`.
 
 ```json
 {
@@ -64,6 +97,7 @@ been requested recently enough to be in the hot set.
 }
 ```
 
+`ts` is ISO 8601 here, not epoch seconds — different mode, different shape.
 `503` if `DATABASE_URL` is not configured.
 
 ### `GET /health`
@@ -153,6 +187,19 @@ User-Agent, calls the API, renders the same fields the OLED draws.
 - Restart: `sudo systemctl restart stock-api`
 - DB: rows live in `prices(symbol TEXT, ts TIMESTAMPTZ, last DOUBLE PRECISION)`
   with a `(symbol, ts DESC)` index. Created on first startup.
+
+## Tests
+
+A smoke test in `tests/` exercises every `range=` value against the live
+service plus a couple of regression checks.
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests/ -v
+```
+
+Set `STOCK_API_BASE` and `TEST_SYMBOL` to point at a different deployment
+or ticker. The test reads `API_SECRET` from `.env`.
 
 ## Security notes
 

@@ -55,6 +55,8 @@ posterity in case the edge ever changes.
 ├── .gitignore
 ├── stock-api.service    ← systemd unit (copy to /etc/systemd/system/)
 ├── nginx.conf.snippet   ← legacy / reference only
+├── requirements-dev.txt ← pytest + requests
+├── tests/               ← pytest smoke tests against the live service
 └── symbols.cache.json   ← persisted universe (gitignored, self-heals)
 ```
 
@@ -82,11 +84,38 @@ behaviors worth knowing:
   touched, so a leaked token can't be used to spam Yahoo with garbage
   tickers and grow the in-memory cache without bound.
 
-### `GET /history/{symbol}?days=N` — minute-bar history
+### `GET /history/{symbol}` — two modes
 
-Returns the time-series of minute-resolution closes we've recorded for the
-symbol. Only available for symbols in the hot LRU set (see "History
-strategy" below). 503 if no `DATABASE_URL` is configured.
+The endpoint serves two distinct data sources behind one URL. The decision
+is which query parameter the caller passes.
+
+**`?range=…`** — served live from yfinance per request and cached
+server-side per `(symbol, range)`. Required for windows longer than the
+30-day archive (`1y`, `max`) and the natural client-facing surface going
+forward. Each range maps to a fixed `(period, interval)` pair (see
+`RANGE_MAP` in `main.py`) chosen to balance resolution against payload
+size. Response carries:
+- `ts` as **epoch seconds** (compact on the wire, trivial to parse on
+  embedded clients).
+- `interval` ∈ {`intraday`, `daily`} so the client knows whether to label
+  the X axis with times or dates without re-deriving from the range.
+- `range` echoed back for debugging.
+
+Per-range TTLs (`RANGE_TTL`): 60 s for `1d`, 5 min for short intraday
+(`5d`/`1w`), 1 h for daily/weekly ranges. Cache key is `(symbol, range)`,
+which also means range-mode responses are de-duped across clients.
+
+**`?days=N`** — legacy minute-bar query from the Postgres archive. Only
+useful for symbols currently in the hot LRU. `ts` stays ISO 8601, the top-
+level key stays `days`, and the response shape is byte-identical to what
+it was before `range=` existed — so the in-field firmware keeps working
+until it migrates. 503 if `DATABASE_URL` is not configured.
+
+The two modes intentionally diverge on `ts` shape — same endpoint, different
+contract per mode. Less ideal than a unified schema, but the alternative
+was either breaking the in-field firmware or shipping a new endpoint just
+for the new format. The asymmetry will disappear when the firmware moves
+to `range=` and `days=N` is removed.
 
 ### `GET /health`
 
@@ -267,6 +296,10 @@ psql "$DATABASE_URL" -c "SELECT symbol, count(*), min(ts), max(ts) FROM prices G
 .venv/bin/python -c "import main; from psycopg_pool import ConnectionPool; \
   main._pool = ConnectionPool(main.DATABASE_URL, open=True); \
   main._mark_hot('AMD'); main._tick_history_sync()"
+
+# run the smoke tests (service must be up)
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests/ -v
 ```
 
 ---
