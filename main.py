@@ -7,11 +7,12 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from psycopg_pool import ConnectionPool
 
 load_dotenv()
@@ -37,12 +38,41 @@ HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "30"))
 HISTORY_MAX_HOT = int(os.getenv("HISTORY_MAX_HOT", "8"))
 MARKET_TZ = ZoneInfo("America/New_York")
 
+RangeKey = Literal["1d", "5d", "1w", "1mo", "6mo", "1y", "max"]
+
+# range → (yfinance period, yfinance interval)
+RANGE_MAP: dict[str, tuple[str, str]] = {
+    "1d":  ("1d",  "5m"),
+    "5d":  ("5d",  "30m"),
+    "1w":  ("7d",  "1h"),
+    "1mo": ("1mo", "1d"),
+    "6mo": ("6mo", "1d"),
+    "1y":  ("1y",  "1d"),
+    "max": ("max", "1wk"),
+}
+
+# server-side cache TTL per range (seconds)
+RANGE_TTL: dict[str, int] = {
+    "1d":  60,
+    "5d":  300,
+    "1w":  300,
+    "1mo": 3600,
+    "6mo": 3600,
+    "1y":  3600,
+    "max": 3600,
+}
+
+# yfinance interval strings considered intraday (anything finer than 1d)
+_INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
+
 # { "AMD": {"ts": datetime, "data": {...}} }
 _cache: dict = {}
 _symbols: set[str] = set()
 _symbols_refreshed_at: datetime | None = None
 _hot: "OrderedDict[str, None]" = OrderedDict()
 _pool: ConnectionPool | None = None
+# { ("AMD","1d"): (fetched_at, payload) }
+_range_cache: dict[tuple[str, str], tuple[datetime, dict]] = {}
 
 
 def _mark_hot(symbol: str) -> None:
@@ -334,17 +364,64 @@ def get_stock(symbol: str, authorization: str = Header(default="")):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-@app.get("/stocks/api/v1/history/{symbol}")
-def get_history(symbol: str, days: int = 7, authorization: str = Header(default="")):
-    _auth(authorization)
-    if days < 1 or days > HISTORY_RETENTION_DAYS:
-        raise HTTPException(status_code=400, detail=f"days must be 1..{HISTORY_RETENTION_DAYS}")
-    if _pool is None:
-        raise HTTPException(status_code=503, detail="history not available")
+def _fetch_range(symbol: str, range_key: str) -> dict:
+    period, interval = RANGE_MAP[range_key]
+    hist = yf.Ticker(symbol).history(period=period, interval=interval)
+    points: list[dict] = []
+    if not hist.empty:
+        for idx, row in hist.iterrows():
+            v = row["Close"]
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                continue
+            ts = idx.to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
+            points.append({"ts": int(ts.timestamp()), "last": round(float(v), 4)})
+    kind = "intraday" if interval in _INTRADAY_INTERVALS else "daily"
+    return {
+        "symbol":   symbol,
+        "range":    range_key,
+        "interval": kind,
+        "count":    len(points),
+        "points":   points,
+    }
 
+
+@app.get(
+    "/stocks/api/v1/history/{symbol}",
+    summary="Historical price points by range (yfinance) or legacy days (archive).",
+)
+def get_history(
+    symbol: str,
+    range_: RangeKey | None = Query(None, alias="range",
+                                    description="One of 1d, 5d, 1w, 1mo, 6mo, 1y, max."),
+    days: int = Query(7, ge=1, le=HISTORY_RETENTION_DAYS,
+                      description="Legacy: minute bars over the last N days from the archive."),
+    authorization: str = Header(default=""),
+):
+    _auth(authorization)
     symbol = symbol.upper()
     if not _is_allowed(symbol):
         raise HTTPException(status_code=400, detail=f"unknown symbol: {symbol}")
+
+    if range_ is not None:
+        key = (symbol, range_)
+        now = datetime.now(tz=timezone.utc)
+        cached = _range_cache.get(key)
+        if cached and (now - cached[0]).total_seconds() < RANGE_TTL[range_]:
+            return cached[1]
+        try:
+            data = _fetch_range(symbol, range_)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        _range_cache[key] = (now, data)
+        return data
+
+    # Legacy ?days=N path — minute bars from the Postgres archive.
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="history not available")
 
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     with _pool.connection() as conn, conn.cursor() as cur:
