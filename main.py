@@ -6,13 +6,17 @@ import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import FileResponse
+from PIL import Image
 from psycopg_pool import ConnectionPool
 
 load_dotenv()
@@ -37,6 +41,21 @@ HISTORY_TICK_SECONDS = int(os.getenv("HISTORY_TICK_SECONDS", "60"))
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "30"))
 HISTORY_MAX_HOT = int(os.getenv("HISTORY_MAX_HOT", "8"))
 MARKET_TZ = ZoneInfo("America/New_York")
+
+LOGO_CACHE_DIR = Path(
+    os.getenv("LOGO_CACHE_DIR", str(Path(__file__).parent / "data" / "logos"))
+)
+LOGO_OVERRIDES_FILE = Path(
+    os.getenv("LOGO_OVERRIDES_FILE", str(Path(__file__).parent / "logo_sources.json"))
+)
+LOGO_SIZE = 64
+LOGO_MISS_TTL = 24 * 3600
+LOGO_USER_AGENT = "stock-api-logo/1.0 (+https://rozakos.eu)"
+
+try:
+    _LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:
+    _LANCZOS = Image.LANCZOS
 
 RangeKey = Literal["1d", "5d", "1w", "1mo", "6mo", "1y", "max"]
 
@@ -73,6 +92,9 @@ _hot: "OrderedDict[str, None]" = OrderedDict()
 _pool: ConnectionPool | None = None
 # { ("AMD","1d"): (fetched_at, payload) }
 _range_cache: dict[tuple[str, str], tuple[datetime, dict]] = {}
+
+_logo_overrides: dict[str, str] = {}
+_logo_locks: dict[str, asyncio.Lock] = {}
 
 
 def _mark_hot(symbol: str) -> None:
@@ -322,6 +344,154 @@ def _get_cached(symbol: str) -> dict | None:
     return None  # expired but keep entry for stale fallback
 
 
+def _load_logo_overrides() -> dict[str, str]:
+    if not LOGO_OVERRIDES_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(LOGO_OVERRIDES_FILE.read_text())
+    except Exception:
+        return {}
+    return {
+        k.upper(): v
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, str) and v
+    }
+
+
+_logo_overrides = _load_logo_overrides()
+
+
+def _logo_lock(symbol: str) -> asyncio.Lock:
+    lock = _logo_locks.get(symbol)
+    if lock is None:
+        lock = _logo_locks[symbol] = asyncio.Lock()
+    return lock
+
+
+def _logo_paths(symbol: str) -> tuple[Path, Path]:
+    LOGO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return LOGO_CACHE_DIR / f"{symbol}.png", LOGO_CACHE_DIR / f"{symbol}.miss.json"
+
+
+def _logo_miss_fresh(miss: Path) -> bool:
+    if not miss.exists():
+        return False
+    try:
+        data = json.loads(miss.read_text())
+        return datetime.utcnow().timestamp() - float(data.get("ts", 0)) < LOGO_MISS_TTL
+    except Exception:
+        return False
+
+
+def _domain_from_website(website: str) -> str | None:
+    if not website:
+        return None
+    parsed = urlparse(website if "://" in website else f"https://{website}")
+    host = (parsed.netloc or parsed.path).strip()
+    if host.startswith("www."):
+        host = host[4:]
+    host = host.split("/")[0]
+    return host or None
+
+
+def _ticker_domain(symbol: str) -> str | None:
+    try:
+        info = yf.Ticker(symbol).info
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    return _domain_from_website(info.get("website") or "")
+
+
+def _http_get(url: str, timeout: int = 10) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": LOGO_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _normalize_to_png(data: bytes, size: int = LOGO_SIZE) -> bytes:
+    img = Image.open(BytesIO(data))
+    img.load()
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    img.thumbnail((size, size), _LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ox = (size - img.width) // 2
+    oy = (size - img.height) // 2
+    canvas.paste(img, (ox, oy), img)
+    buf = BytesIO()
+    canvas.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _try_source(url: str) -> bytes | None:
+    try:
+        raw = _http_get(url)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return _normalize_to_png(raw)
+    except Exception:
+        return None
+
+
+def _domain_logo_sources(domain: str) -> list[str]:
+    """Public favicon/logo sources that take a bare domain and return an
+    image. DuckDuckGo's ip3 endpoint usually returns the highest-quality
+    icon (often a real logo); Google's s2 endpoint is the universal
+    fallback that always returns *something*.
+    """
+    return [
+        f"https://icons.duckduckgo.com/ip3/{domain}.ico",
+        f"https://www.google.com/s2/favicons?domain={domain}&sz=128",
+    ]
+
+
+def _resolve_logo_sync(symbol: str) -> bytes | None:
+    """Try each source in order, short-circuiting on first success.
+
+    Order: manual override → yfinance .info website (via DuckDuckGo, then
+    Google s2). Sources are tried lazily — yfinance is only consulted if
+    the override is missing or fails, since .info round-trips to Yahoo
+    and is slow.
+    """
+    override = _logo_overrides.get(symbol)
+    if override:
+        png = _try_source(override)
+        if png:
+            return png
+    domain = _ticker_domain(symbol)
+    if domain:
+        for url in _domain_logo_sources(domain):
+            png = _try_source(url)
+            if png:
+                return png
+    return None
+
+
+async def _ensure_logo(symbol: str) -> Path | None:
+    img_path, miss_path = _logo_paths(symbol)
+    if img_path.exists():
+        return img_path
+    if _logo_miss_fresh(miss_path):
+        return None
+    async with _logo_lock(symbol):
+        if img_path.exists():
+            return img_path
+        if _logo_miss_fresh(miss_path):
+            return None
+        png = await asyncio.to_thread(_resolve_logo_sync, symbol)
+        if png:
+            img_path.write_bytes(png)
+            miss_path.unlink(missing_ok=True)
+            return img_path
+        miss_path.write_text(json.dumps({"ts": datetime.utcnow().timestamp()}))
+        return None
+
+
 @app.get("/stocks/api/v1/health")
 def health():
     return {
@@ -437,3 +607,38 @@ def get_history(
         "count":  len(rows),
         "points": [{"ts": ts.isoformat(), "last": last} for ts, last in rows],
     }
+
+
+@app.get("/stocks/api/v1/logo/{symbol}")
+async def get_logo(symbol: str, authorization: str = Header(default="")):
+    _auth(authorization)
+    symbol = symbol.upper()
+    if not _is_allowed(symbol):
+        raise HTTPException(status_code=400, detail=f"unknown symbol: {symbol}")
+    path = await _ensure_logo(symbol)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"no logo for {symbol}")
+    return FileResponse(
+        path,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=2592000, immutable"},
+    )
+
+
+@app.get("/stocks/api/v1/logos")
+def get_logos_manifest(
+    symbols: str = Query(..., description="Comma-separated tickers."),
+    authorization: str = Header(default=""),
+):
+    _auth(authorization)
+    out: dict[str, dict] = {}
+    for raw in symbols.split(","):
+        s = raw.strip().upper()
+        if not s or s in out:
+            continue
+        img_path, _ = _logo_paths(s)
+        out[s] = {
+            "url": f"/stocks/api/v1/logo/{s}",
+            "cached": img_path.exists(),
+        }
+    return {"logos": out}

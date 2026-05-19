@@ -100,6 +100,49 @@ in-field ESP8266 firmware until it migrates to `range=`.
 `ts` is ISO 8601 here, not epoch seconds — different mode, different shape.
 `503` if `DATABASE_URL` is not configured.
 
+### `GET /logo/{symbol}` and `GET /logos`
+
+Serves cached ticker logos so devices don't need to embed every PNG in
+firmware flash. Both endpoints require the bearer token.
+
+**`GET /logo/{symbol}`** returns a 64×64 PNG. Symbol is case-insensitive.
+On a miss, the server resolves the logo on the fly through this chain:
+
+1. Manual override in `logo_sources.json` — `{ "IONQ": "https://..." }`.
+   Useful for symbols where auto-resolution returns something wrong or
+   ugly.
+2. The company website from `yfinance.Ticker(symbol).info["website"]`,
+   resolved to a logo via DuckDuckGo's `icons.duckduckgo.com/ip3/{domain}.ico`
+   (highest-quality), with Google's `s2/favicons?domain={domain}&sz=128`
+   as a universal fallback.
+3. If all sources fail, the symbol is remembered as a "miss" for 24h to
+   avoid retry storms, and the endpoint returns `404 {"detail": "no
+   logo for X"}`.
+
+Successful logos are written to `LOGO_CACHE_DIR` and served with
+`Cache-Control: public, max-age=2592000, immutable` so the device (and
+Cloudflare, if you configure it to ignore the auth header on this
+path) can cache aggressively.
+
+**`GET /logos?symbols=AAPL,IONQ,NVDA`** returns a JSON manifest without
+fetching anything — handy for the device to check which logos it can
+download cheaply:
+
+```json
+{
+  "logos": {
+    "AAPL": { "url": "/stocks/api/v1/logo/AAPL", "cached": true },
+    "IONQ": { "url": "/stocks/api/v1/logo/IONQ", "cached": false }
+  }
+}
+```
+
+To pre-warm the cache from the command line:
+
+```bash
+.venv/bin/python scripts/fetch_logos.py AAPL IONQ NVDA TSLA
+```
+
 ### `GET /health`
 
 No auth. Useful for uptime checks and seeing service state:
@@ -162,6 +205,8 @@ If you're fronting with nginx instead, see `nginx.conf.snippet`.
 | `HISTORY_TICK_SECONDS` | 60 | How often to record minute bars. |
 | `HISTORY_RETENTION_DAYS` | 30 | Older rows are pruned on each tick. |
 | `HISTORY_MAX_HOT` | 8 | LRU cap on archived symbols. Hitting `/stock/{X}` bumps `X` to the front; oldest is evicted when full. |
+| `LOGO_CACHE_DIR` | `data/logos` | Where resolved logos are stored as 64×64 PNGs. Relative paths are resolved from the project root. |
+| `LOGO_OVERRIDES_FILE` | `logo_sources.json` | JSON map of `TICKER -> logo URL` to override the auto-resolution chain. |
 
 The on-disk file `symbols.cache.json` stores the last fetched symbol universe
 so restarts don't depend on the network. It's gitignored and self-heals on
