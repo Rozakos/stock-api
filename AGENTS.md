@@ -117,6 +117,25 @@ was either breaking the in-field firmware or shipping a new endpoint just
 for the new format. The asymmetry will disappear when the firmware moves
 to `range=` and `days=N` is removed.
 
+### `GET /logo/{symbol}` and `GET /logos`
+
+Serves a 64x64 PNG per ticker, cached on disk under `LOGO_CACHE_DIR`.
+Resolution order is `logo_sources.json` override → ticker domain → public
+favicon/logo sources (Clearbit, Google s2). Misses are remembered in a
+`{SYM}.miss.json` marker with a 24 h TTL to avoid hammering upstreams for
+tickers that have no findable logo. `/logos?symbols=A,B,C` is the manifest
+endpoint — returns one URL + cache-status entry per symbol, no images.
+
+**`?test=1` diagnostic mode** — `GET /logo/{symbol}?test=1` (or env
+`STOCK_API_LOGO_TEST=1`) skips the resolver and the cache and returns a
+synthetic 64x64 RGBA PNG: red background, green diagonal stripe, blue
+center dot, `Cache-Control: no-store`. Exists to isolate firmware-side
+PNG render bugs from logo-content/contrast issues. If the device renders
+the red/green/blue mark, the rendering path works and the real logos are
+a contrast problem; if not, the renderer (e.g. LVGL file-PNG) is the
+suspect, not the API. Remove or gate this if it ever becomes load-bearing
+in production traffic.
+
 ### `GET /health`
 
 No auth. Exposes:
