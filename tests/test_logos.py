@@ -23,6 +23,24 @@ def _png_bytes(color: tuple[int, int, int, int] = (0, 128, 255, 255), size: int 
     return buf.getvalue()
 
 
+def _image_bytes(img: Image.Image) -> bytes:
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _alpha_bbox(img: Image.Image) -> tuple[int, int, int, int]:
+    alpha = img.convert("RGBA").getchannel("A")
+    mask = alpha.point(lambda a: 255 if a > 8 else 0)
+    bbox = mask.getbbox()
+    assert bbox is not None
+    return bbox
+
+
+def _normalized_img(data: bytes) -> Image.Image:
+    return Image.open(BytesIO(main._normalize_to_png(data))).convert("RGBA")
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "API_SECRET", "")
@@ -30,6 +48,43 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "_logo_overrides", {})
     monkeypatch.setattr(main, "_logo_locks", {})
     return TestClient(main.app)
+
+
+def test_normalize_crops_transparent_padding_and_enlarges_logo():
+    src = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    mark = Image.new("RGBA", (40, 40), (0, 128, 255, 255))
+    src.paste(mark, (44, 44), mark)
+
+    out = _normalized_img(_image_bytes(src))
+    bbox = _alpha_bbox(out)
+
+    assert out.mode == "RGBA"
+    assert out.size == (64, 64)
+    assert bbox == (2, 2, 62, 62)
+
+
+def test_normalize_preserves_wide_logo_aspect_ratio_and_centers():
+    src = Image.new("RGBA", (160, 40), (255, 80, 0, 255))
+
+    out = _normalized_img(_image_bytes(src))
+    left, top, right, bottom = _alpha_bbox(out)
+
+    assert (right - left, bottom - top) == (60, 15)
+    assert left == 2
+    assert right == 62
+    assert abs(top - (64 - bottom)) <= 1
+
+
+def test_normalize_preserves_tall_logo_aspect_ratio_and_centers():
+    src = Image.new("RGBA", (40, 160), (0, 160, 80, 255))
+
+    out = _normalized_img(_image_bytes(src))
+    left, top, right, bottom = _alpha_bbox(out)
+
+    assert (right - left, bottom - top) == (15, 60)
+    assert top == 2
+    assert bottom == 62
+    assert abs(left - (64 - right)) <= 1
 
 
 def test_symbol_is_uppercased(client, monkeypatch, tmp_path):

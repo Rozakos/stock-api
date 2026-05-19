@@ -125,6 +125,9 @@ favicon/logo sources (Clearbit, Google s2). Misses are remembered in a
 `{SYM}.miss.json` marker with a 24 h TTL to avoid hammering upstreams for
 tickers that have no findable logo. `/logos?symbols=A,B,C` is the manifest
 endpoint — returns one URL + cache-status entry per symbol, no images.
+Normalization is applied only when a logo is first fetched; if the crop/
+resize logic changes, delete existing cached `*.png` files and pre-warm
+again so old padded images are not served forever.
 
 **`?test=1` diagnostic mode** — `GET /logo/{symbol}?test=1` (or env
 `STOCK_API_LOGO_TEST=1`) skips the resolver and the cache and returns a

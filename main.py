@@ -52,6 +52,7 @@ LOGO_OVERRIDES_FILE = Path(
 LOGO_SIZE = 64
 LOGO_MISS_TTL = 24 * 3600
 LOGO_USER_AGENT = "stock-api-logo/1.0 (+https://rozakos.eu)"
+LOGO_CONTENT_SIZE = 60
 
 try:
     _LANCZOS = Image.Resampling.LANCZOS
@@ -441,12 +442,25 @@ def _http_get(url: str, timeout: int = 10) -> bytes:
         return resp.read()
 
 
-def _normalize_to_png(data: bytes, size: int = LOGO_SIZE) -> bytes:
+def _normalize_to_png(
+    data: bytes,
+    size: int = LOGO_SIZE,
+    max_content_size: int = LOGO_CONTENT_SIZE,
+) -> bytes:
     img = Image.open(BytesIO(data))
     img.load()
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    img.thumbnail((size, size), _LANCZOS)
+    img = img.convert("RGBA")
+    alpha = img.getchannel("A")
+    content_mask = alpha.point(lambda a: 255 if a > 8 else 0)
+    bbox = content_mask.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+    scale = min(max_content_size / img.width, max_content_size / img.height)
+    target = (
+        max(1, round(img.width * scale)),
+        max(1, round(img.height * scale)),
+    )
+    img = img.resize(target, _LANCZOS)
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     ox = (size - img.width) // 2
     oy = (size - img.height) // 2

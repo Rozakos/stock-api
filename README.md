@@ -143,6 +143,15 @@ To pre-warm the cache from the command line:
 .venv/bin/python scripts/fetch_logos.py AAPL IONQ NVDA TSLA
 ```
 
+Logo normalization is applied only when a logo is first fetched. If the
+normalization logic changes, remove existing cached PNGs before pre-warming
+again, otherwise `/logo/{symbol}` will keep serving the old files:
+
+```bash
+find "${LOGO_CACHE_DIR:-data/logos}" -maxdepth 1 -type f -name '*.png' -delete
+.venv/bin/python scripts/fetch_logos.py AAPL IONQ NVDA TSLA
+```
+
 ### `GET /health`
 
 No auth. Useful for uptime checks and seeing service state:
