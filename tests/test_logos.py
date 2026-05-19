@@ -115,6 +115,27 @@ def test_manifest_skips_empties_and_dedupes(client, tmp_path):
     assert set(logos.keys()) == {"AAPL", "NVDA"}
 
 
+def test_test_mode_returns_synthetic_png(client, monkeypatch, tmp_path):
+    def must_not_be_called(symbol: str) -> bytes | None:
+        raise AssertionError(f"resolver should not be called in test mode; got {symbol}")
+
+    monkeypatch.setattr(main, "_resolve_logo_sync", must_not_be_called)
+    r = client.get("/stocks/api/v1/logo/ASML", params={"test": 1})
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "image/png"
+    assert r.headers["cache-control"] == "no-store"
+    img = Image.open(BytesIO(r.content))
+    assert img.mode == "RGBA"
+    assert img.size == (64, 64)
+    pixels = img.load()
+    # corner = red background, center = blue dot, diagonal mid = green stripe
+    assert pixels[0, 0] == (255, 0, 0, 255)
+    assert pixels[32, 32] == (0, 0, 255, 255)
+    assert pixels[16, 16] == (0, 255, 0, 255)
+    # test mode must not write to cache
+    assert not (tmp_path / "ASML.png").exists()
+
+
 def test_miss_marker_short_circuits_retries(client, monkeypatch, tmp_path):
     calls: list[str] = []
 

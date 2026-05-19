@@ -16,8 +16,8 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
-from PIL import Image
+from fastapi.responses import FileResponse, Response
+from PIL import Image, ImageDraw
 from psycopg_pool import ConnectionPool
 
 load_dotenv()
@@ -640,12 +640,36 @@ def get_history(
     }
 
 
+def _test_logo_png() -> bytes:
+    img = Image.new("RGBA", (LOGO_SIZE, LOGO_SIZE), (255, 0, 0, 255))
+    draw = ImageDraw.Draw(img)
+    draw.line([(0, 0), (LOGO_SIZE - 1, LOGO_SIZE - 1)], fill=(0, 255, 0, 255), width=6)
+    cx = cy = LOGO_SIZE // 2
+    r = 8
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(0, 0, 255, 255))
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 @app.get("/stocks/api/v1/logo/{symbol}")
-async def get_logo(symbol: str, authorization: str = Header(default="")):
+async def get_logo(
+    symbol: str,
+    test: int = 0,
+    authorization: str = Header(default=""),
+):
     _auth(authorization)
     symbol = symbol.upper()
     if not _is_allowed(symbol):
         raise HTTPException(status_code=400, detail=f"unknown symbol: {symbol}")
+    if test or os.getenv("STOCK_API_LOGO_TEST") == "1":
+        data = _test_logo_png()
+        print(f"[logo] {symbol} test=1 bytes={len(data)} dims={LOGO_SIZE}x{LOGO_SIZE}")
+        return Response(
+            content=data,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
     path = await _ensure_logo(symbol)
     if path is None:
         raise HTTPException(status_code=404, detail=f"no logo for {symbol}")
