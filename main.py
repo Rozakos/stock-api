@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import os
+import time
 import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -294,6 +295,36 @@ app = FastAPI(
     redoc_url=None,
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def access_log(request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception:
+        ms = int((time.perf_counter() - start) * 1000)
+        ip = request.headers.get("cf-connecting-ip") or (
+            request.client.host if request.client else "-"
+        )
+        print(
+            f"access {request.method} {request.url.path} -> 500 {ms}ms ip={ip} EXC",
+            flush=True,
+        )
+        raise
+    ms = int((time.perf_counter() - start) * 1000)
+    ip = request.headers.get("cf-connecting-ip") or (
+        request.client.host if request.client else "-"
+    )
+    ua = (request.headers.get("user-agent") or "-")[:60].replace('"', "'")
+    q = f"?{request.url.query}" if request.url.query else ""
+    print(
+        f'access {request.method} {request.url.path}{q} -> {status} {ms}ms '
+        f'ip={ip} ua="{ua}"',
+        flush=True,
+    )
+    return response
 
 
 def _auth(authorization: str):
