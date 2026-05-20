@@ -124,6 +124,20 @@ Successful logos are written to `LOGO_CACHE_DIR` and served with
 Cloudflare, if you configure it to ignore the auth header on this
 path) can cache aggressively.
 
+**`?size=` query parameter** — accepts `32`, `48`, or `64` (default
+`64`). Anything else returns `400`. `size=64` serves the cached file
+byte-identical; `size=32` and `size=48` resize the cached 64×64 PNG
+on-the-fly with LANCZOS, preserving the RGBA alpha channel. Useful for
+embedded clients with constrained transient heap during PNG decode —
+e.g. the ESP32 CYD firmware needs `?size=48` to keep lodepng's
+allocation inside its largest free block after WiFi+TLS.
+
+**`?test=1` diagnostic mode** — bypasses the resolver and cache and
+returns a synthetic 64×64 RGBA PNG (red background, green diagonal,
+blue center dot, `Cache-Control: no-store`). Exists to separate
+firmware-side PNG render bugs from logo-content/contrast issues. Can
+also be forced server-wide with env `STOCK_API_LOGO_TEST=1`.
+
 **`GET /logos?symbols=AAPL,IONQ,NVDA`** returns a JSON manifest without
 fetching anything — handy for the device to check which logos it can
 download cheaply:

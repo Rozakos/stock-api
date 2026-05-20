@@ -129,6 +129,17 @@ Normalization is applied only when a logo is first fetched; if the crop/
 resize logic changes, delete existing cached `*.png` files and pre-warm
 again so old padded images are not served forever.
 
+**`?size=` query parameter** — accepts `{32, 48, 64}`, default `64`,
+anything else 400s. `size=64` returns the cached file via FileResponse
+byte-identical to the no-arg path, so existing clients are unaffected.
+`size=32` and `size=48` open the cached 64×64 PNG with Pillow and
+resize via LANCZOS preserving RGBA, served with the same long-cache
+headers. Driven by the ESP32 CYD firmware: lodepng peaks ~60 KB
+transient for a 64×64 RGBA decode, but the largest contiguous heap
+block after WiFi+TLS is ~40 KB — so the device requests `?size=48`.
+Resizing on read (not write) keeps the on-disk cache as the highest-
+fidelity copy and avoids fanning out the cache directory per size.
+
 **`?test=1` diagnostic mode** — `GET /logo/{symbol}?test=1` (or env
 `STOCK_API_LOGO_TEST=1`) skips the resolver and the cache and returns a
 synthetic 64x64 RGBA PNG: red background, green diagonal stripe, blue

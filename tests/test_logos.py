@@ -170,6 +170,35 @@ def test_manifest_skips_empties_and_dedupes(client, tmp_path):
     assert set(logos.keys()) == {"AAPL", "NVDA"}
 
 
+def test_size_param_returns_resized_png(client, tmp_path):
+    (tmp_path / "AAPL.png").write_bytes(_png_bytes((10, 200, 50, 255), size=64))
+    r = client.get("/stocks/api/v1/logo/AAPL", params={"size": 48})
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "image/png"
+    assert "max-age=2592000" in r.headers["cache-control"]
+    img = Image.open(BytesIO(r.content))
+    assert img.size == (48, 48)
+    assert img.mode == "RGBA"
+
+
+def test_size_64_is_byte_identical_to_default(client, tmp_path):
+    raw = _png_bytes((10, 200, 50, 255), size=64)
+    (tmp_path / "AAPL.png").write_bytes(raw)
+    default = client.get("/stocks/api/v1/logo/AAPL")
+    sized = client.get("/stocks/api/v1/logo/AAPL", params={"size": 64})
+    assert default.status_code == 200
+    assert sized.status_code == 200
+    assert default.content == raw
+    assert sized.content == raw
+
+
+def test_size_rejects_unsupported_values(client, tmp_path):
+    (tmp_path / "AAPL.png").write_bytes(_png_bytes(size=64))
+    r = client.get("/stocks/api/v1/logo/AAPL", params={"size": 96})
+    assert r.status_code == 400
+    assert "size" in r.json()["detail"].lower()
+
+
 def test_test_mode_returns_synthetic_png(client, monkeypatch, tmp_path):
     def must_not_be_called(symbol: str) -> bytes | None:
         raise AssertionError(f"resolver should not be called in test mode; got {symbol}")

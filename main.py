@@ -666,16 +666,25 @@ def _test_logo_png() -> bytes:
     return buf.getvalue()
 
 
+LOGO_ALLOWED_SIZES = {32, 48, 64}
+
+
 @app.get("/stocks/api/v1/logo/{symbol}")
 async def get_logo(
     symbol: str,
     test: int = 0,
+    size: int = 64,
     authorization: str = Header(default=""),
 ):
     _auth(authorization)
     symbol = symbol.upper()
     if not _is_allowed(symbol):
         raise HTTPException(status_code=400, detail=f"unknown symbol: {symbol}")
+    if size not in LOGO_ALLOWED_SIZES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"size must be one of {sorted(LOGO_ALLOWED_SIZES)}",
+        )
     if test or os.getenv("STOCK_API_LOGO_TEST") == "1":
         data = _test_logo_png()
         print(f"[logo] {symbol} test=1 bytes={len(data)} dims={LOGO_SIZE}x{LOGO_SIZE}")
@@ -687,8 +696,18 @@ async def get_logo(
     path = await _ensure_logo(symbol)
     if path is None:
         raise HTTPException(status_code=404, detail=f"no logo for {symbol}")
-    return FileResponse(
-        path,
+    if size == LOGO_SIZE:
+        return FileResponse(
+            path,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=2592000, immutable"},
+        )
+    with Image.open(path) as src:
+        img = src.convert("RGBA").resize((size, size), _LANCZOS)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return Response(
+        content=buf.getvalue(),
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=2592000, immutable"},
     )
