@@ -56,17 +56,17 @@ Yahoo failure with no prior cache.
 ### `GET /history/{symbol}` — two modes
 
 **`?range=…`** (recommended) — served live from yfinance and cached
-server-side. One of `1d`, `5d`, `1w`, `1mo`, `6mo`, `1y`, `max`. The server
+server-side. One of `1d`, `1w`, `1mo`, `6mo`, `1y`, `5y`, `max`. The server
 maps each range to a fixed period+interval pair:
 
 | `range` | yfinance period | yfinance interval | `interval` field | cache TTL |
 |---|---|---|---|---|
 | `1d`  | `1d`  | `5m`  | `intraday` | 60 s |
-| `5d`  | `5d`  | `30m` | `intraday` | 5 min |
 | `1w`  | `7d`  | `1h`  | `intraday` | 5 min |
 | `1mo` | `1mo` | `1d`  | `daily`    | 1 h |
 | `6mo` | `6mo` | `1d`  | `daily`    | 1 h |
 | `1y`  | `1y`  | `1d`  | `daily`    | 1 h |
+| `5y`  | `5y`  | `1wk` | `daily`    | 1 h |
 | `max` | `max` | `1wk` | `daily`    | 1 h |
 
 ```json

@@ -102,7 +102,7 @@ size. Response carries:
 - `range` echoed back for debugging.
 
 Per-range TTLs (`RANGE_TTL`): 60 s for `1d`, 5 min for short intraday
-(`5d`/`1w`), 1 h for daily/weekly ranges. Cache key is `(symbol, range)`,
+(`1w`), 1 h for daily/weekly ranges. Cache key is `(symbol, range)`,
 which also means range-mode responses are de-duped across clients.
 
 **`?days=N`** — legacy minute-bar query from the Postgres archive. Only

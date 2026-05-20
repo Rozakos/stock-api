@@ -59,27 +59,27 @@ try:
 except AttributeError:
     _LANCZOS = Image.LANCZOS
 
-RangeKey = Literal["1d", "5d", "1w", "1mo", "6mo", "1y", "max"]
+RangeKey = Literal["1d", "1w", "1mo", "6mo", "1y", "5y", "max"]
 
 # range → (yfinance period, yfinance interval)
 RANGE_MAP: dict[str, tuple[str, str]] = {
     "1d":  ("1d",  "5m"),
-    "5d":  ("5d",  "30m"),
     "1w":  ("7d",  "1h"),
     "1mo": ("1mo", "1d"),
     "6mo": ("6mo", "1d"),
     "1y":  ("1y",  "1d"),
+    "5y":  ("5y",  "1wk"),
     "max": ("max", "1wk"),
 }
 
 # server-side cache TTL per range (seconds)
 RANGE_TTL: dict[str, int] = {
     "1d":  60,
-    "5d":  300,
     "1w":  300,
     "1mo": 3600,
     "6mo": 3600,
     "1y":  3600,
+    "5y":  3600,
     "max": 3600,
 }
 
@@ -611,7 +611,7 @@ def _fetch_range(symbol: str, range_key: str) -> dict:
 def get_history(
     symbol: str,
     range_: RangeKey | None = Query(None, alias="range",
-                                    description="One of 1d, 5d, 1w, 1mo, 6mo, 1y, max."),
+                                    description="One of 1d, 1w, 1mo, 6mo, 1y, 5y, max."),
     days: int = Query(7, ge=1, le=HISTORY_RETENTION_DAYS,
                       description="Legacy: minute bars over the last N days from the archive."),
     authorization: str = Header(default=""),

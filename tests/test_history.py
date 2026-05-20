@@ -20,11 +20,11 @@ HEADERS = {
 
 RANGES: list[tuple[str, str]] = [
     ("1d",  "intraday"),
-    ("5d",  "intraday"),
     ("1w",  "intraday"),
     ("1mo", "daily"),
     ("6mo", "daily"),
     ("1y",  "daily"),
+    ("5y",  "daily"),
     ("max", "daily"),
 ]
 
