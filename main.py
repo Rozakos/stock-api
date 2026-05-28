@@ -705,6 +705,33 @@ def _fetch_range(symbol: str, range_key: str) -> dict:
     return result
 
 
+def _downsample(points: list, limit: int) -> list:
+    """Uniformly sample `points` down to at most `limit` items, always
+    keeping the first and last point so the displayed % change stays
+    correct. Returns the list unchanged when it's already small enough."""
+    n = len(points)
+    if limit <= 0 or n <= limit:
+        return points
+    if limit == 1:
+        return [points[-1]]
+    step = (n - 1) / (limit - 1)
+    indices = sorted({round(i * step) for i in range(limit)})
+    return [points[i] for i in indices]
+
+
+def _apply_limit(data: dict, limit: int | None) -> dict:
+    """Return a copy of a range payload downsampled to <= limit points.
+    Leaves the cached payload untouched and preserves every other field
+    (interval, session bounds, …); `count` is updated to match."""
+    if not limit:
+        return data
+    points = data["points"]
+    if len(points) <= limit:
+        return data
+    sampled = _downsample(points, limit)
+    return {**data, "count": len(sampled), "points": sampled}
+
+
 @app.get(
     "/stocks/api/v1/history/{symbol}",
     summary="Historical price points by range (yfinance) or legacy days (archive).",
@@ -713,6 +740,10 @@ def get_history(
     symbol: str,
     range_: RangeKey | None = Query(None, alias="range",
                                     description="One of 1d, 1w, 1mo, 6mo, 1y, 5y, max."),
+    limit: int | None = Query(None, ge=1,
+                              description="Max points to return for range=… ; "
+                                          "server downsamples uniformly, keeping "
+                                          "the first and last point."),
     days: int = Query(7, ge=1, le=HISTORY_RETENTION_DAYS,
                       description="Legacy: minute bars over the last N days from the archive."),
     authorization: str = Header(default=""),
@@ -727,13 +758,13 @@ def get_history(
         now = datetime.now(tz=timezone.utc)
         cached = _range_cache.get(key)
         if cached and (now - cached[0]).total_seconds() < RANGE_TTL[range_]:
-            return cached[1]
+            return _apply_limit(cached[1], limit)
         try:
             data = _fetch_range(symbol, range_)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         _range_cache[key] = (now, data)
-        return data
+        return _apply_limit(data, limit)
 
     # Legacy ?days=N path — minute bars from the Postgres archive.
     if _pool is None:
