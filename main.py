@@ -579,9 +579,102 @@ def get_stock(symbol: str, authorization: str = Header(default="")):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+def _to_utc_dt(value) -> datetime | None:
+    """Coerce a yfinance metadata timestamp (epoch number, datetime, or
+    pandas Timestamp) into a tz-aware UTC datetime. Returns None for NaT or
+    anything unrecognized."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    # pandas NaT / float NaN are never equal to themselves; NaT also sneaks
+    # past the datetime isinstance check below, so reject it up front.
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    to_py = getattr(value, "to_pydatetime", None)
+    if callable(to_py):
+        value = to_py()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return None
+
+
+def _trading_period_rows(periods) -> list[tuple[datetime | None, datetime | None]]:
+    """Normalize history_metadata['tradingPeriods'] into (start, end) UTC
+    datetime pairs, one per regular session. Handles both the pandas
+    DataFrame form (one row per day) and the nested-list-of-dicts form."""
+    if periods is None:
+        return []
+    if hasattr(periods, "columns") and hasattr(periods, "itertuples"):
+        cols = list(periods.columns)
+        if "start" in cols and "end" in cols:
+            return [
+                (_to_utc_dt(row.start), _to_utc_dt(row.end))
+                for row in periods.itertuples(index=False)
+            ]
+        return []
+    out: list[tuple[datetime | None, datetime | None]] = []
+    if isinstance(periods, list):
+        stack = list(periods)
+        while stack:
+            item = stack.pop(0)
+            if isinstance(item, list):
+                stack = item + stack
+            elif isinstance(item, dict) and "start" in item and "end" in item:
+                out.append((_to_utc_dt(item["start"]), _to_utc_dt(item["end"])))
+    return out
+
+
+def _session_bounds_for(ticker, points: list[dict]) -> tuple[int, int] | None:
+    """Regular-session open/close (epoch seconds, UTC) for the trading day
+    the intraday points cover. Sourced from yfinance chart metadata so
+    half-days/holidays use the exchange's real session, never a hardcoded
+    16:00. Returns None when the bounds can't be determined."""
+    if not points:
+        return None
+    meta = getattr(ticker, "history_metadata", None) or {}
+
+    tz_name = meta.get("exchangeTimezoneName")
+    try:
+        market_tz = ZoneInfo(tz_name) if tz_name else MARKET_TZ
+    except Exception:
+        market_tz = MARKET_TZ
+
+    target_day = (
+        datetime.fromtimestamp(points[-1]["ts"], tz=timezone.utc)
+        .astimezone(market_tz)
+        .date()
+    )
+
+    # Preferred source: the per-day regular session from tradingPeriods.
+    for start, end in _trading_period_rows(meta.get("tradingPeriods")):
+        if start is None or end is None:
+            continue
+        if start.astimezone(market_tz).date() == target_day:
+            return int(start.timestamp()), int(end.timestamp())
+
+    # Fallback: currentTradingPeriod.regular, only if it lands on the same day.
+    regular = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+    start = _to_utc_dt(regular.get("start"))
+    end = _to_utc_dt(regular.get("end"))
+    if start is not None and end is not None:
+        if start.astimezone(market_tz).date() == target_day:
+            return int(start.timestamp()), int(end.timestamp())
+
+    return None
+
+
 def _fetch_range(symbol: str, range_key: str) -> dict:
     period, interval = RANGE_MAP[range_key]
-    hist = yf.Ticker(symbol).history(period=period, interval=interval)
+    ticker = yf.Ticker(symbol)
+    hist = ticker.history(period=period, interval=interval)
     points: list[dict] = []
     if not hist.empty:
         for idx, row in hist.iterrows():
@@ -595,13 +688,21 @@ def _fetch_range(symbol: str, range_key: str) -> dict:
                 ts = ts.astimezone(timezone.utc)
             points.append({"ts": int(ts.timestamp()), "last": round(float(v), 4)})
     kind = "intraday" if interval in _INTRADAY_INTERVALS else "daily"
-    return {
+    result = {
         "symbol":   symbol,
         "range":    range_key,
         "interval": kind,
         "count":    len(points),
         "points":   points,
     }
+    # range=1d only: expose the day's regular-session window so the device can
+    # render the whole session as a fixed X axis (Revolut-style). Omitted when
+    # bounds are unavailable — the client then falls back to a 6.5h assumption.
+    if range_key == "1d":
+        bounds = _session_bounds_for(ticker, points)
+        if bounds is not None:
+            result["session_open"], result["session_close"] = bounds
+    return result
 
 
 @app.get(
