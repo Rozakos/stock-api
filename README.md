@@ -23,7 +23,9 @@ ESP8266 ──HTTPS──▶ Cloudflare ──tunnel──▶ stock-api (FastAPI
   hours, retained 30 days. Queryable via `GET /history/{symbol}?days=N`.
 - **Range history** — `GET /history/{symbol}?range=…` returns longer windows
   (up to `max`) fetched live from yfinance at fixed period+interval pairs,
-  server-cached with TTLs tuned per range.
+  server-cached with TTLs tuned per range. An optional `&limit=N` downsamples
+  the series server-side so memory-constrained clients (ESP32) never have to
+  parse a multi-thousand-point `max` response.
 
 ## API
 
@@ -83,6 +85,39 @@ maps each range to a fixed period+interval pair:
 the X axis as time-of-day (`intraday`) or as dates (`daily`).
 
 Invalid `range` values return `422` (FastAPI validation).
+
+**`range=1d` session window** — the `1d` response additionally carries the
+day's *regular* trading session as top-level `session_open` / `session_close`
+(epoch seconds, UTC), so a client can render the whole session as a fixed X
+axis (Revolut-style) and grow the line through it. The bounds come from
+yfinance chart metadata, so half-days and holidays use the exchange's real
+session rather than a hardcoded 16:00. `points` stays ascending and contains
+only elapsed data up to "now" — the future is **not** padded. If the bounds
+can't be determined they're omitted, and the client should fall back to a
+6.5h assumption.
+
+```json
+{
+  "symbol": "AMD",
+  "range": "1d",
+  "interval": "intraday",
+  "session_open": 1779975000,
+  "session_close": 1779998400,
+  "count": 78,
+  "points": [{"ts": 1779975000, "last": 98.12}, ...]
+}
+```
+
+**`&limit=N`** (optional, `N ≥ 1`, any range) — caps the response at `N`
+points by **uniform downsampling on the server**, always keeping the first
+and last point so the displayed % change stays correct. Without it, `range=max`
+returns the full series (a few thousand points for old listings like AAPL/IBM/KO),
+which can exhaust RAM on an ESP32 that buffers the whole body before
+downsampling. With it, e.g. `range=max&limit=30` returns ≤ 30 points. The
+range cache stores the full series, so different `limit` values for the same
+symbol/range are all served from one cached fetch. `count` reflects the
+returned (downsampled) length; the rest of the shape is unchanged. `limit`
+applies only to `range=` — the legacy `days=` path ignores it.
 
 **`?days=N`** (legacy, 1 ≤ N ≤ 30) — served from the Postgres minute-bar
 archive. Returned only for symbols currently in the hot LRU. Kept for the
