@@ -43,6 +43,16 @@ HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "30"))
 HISTORY_MAX_HOT = int(os.getenv("HISTORY_MAX_HOT", "8"))
 MARKET_TZ = ZoneInfo("America/New_York")
 
+# Background quote poller: refreshes the *active working set* (symbols any
+# device asked for recently) in batches, so upstream Yahoo load is bounded by
+# the number of distinct symbols, not by the number of devices. Device
+# requests then serve from the in-memory cache the poller fills.
+QUOTE_POLL_SECONDS = int(os.getenv("QUOTE_POLL_SECONDS", "60"))
+QUOTE_POLL_CLOSED_SECONDS = int(os.getenv("QUOTE_POLL_CLOSED_SECONDS", "300"))
+QUOTE_ACTIVE_WINDOW = int(os.getenv("QUOTE_ACTIVE_WINDOW_SECONDS", "900"))
+QUOTE_MAX_ACTIVE = int(os.getenv("QUOTE_MAX_ACTIVE", "1000"))
+QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))
+
 LOGO_CACHE_DIR = Path(
     os.getenv("LOGO_CACHE_DIR", str(Path(__file__).parent / "data" / "logos"))
 )
@@ -94,6 +104,11 @@ _hot: "OrderedDict[str, None]" = OrderedDict()
 _pool: ConnectionPool | None = None
 # { ("AMD","1d"): (fetched_at, payload) }
 _range_cache: dict[tuple[str, str], tuple[datetime, dict]] = {}
+
+# { "AMD": last_requested_at } — the quote poller's working set.
+_active: dict[str, datetime] = {}
+_quote_poll_at: datetime | None = None
+_quote_poll_ok: bool = False
 
 _logo_overrides: dict[str, str] = {}
 _logo_locks: dict[str, asyncio.Lock] = {}
@@ -281,11 +296,13 @@ async def lifespan(app: FastAPI):
 
     symbols_task = asyncio.create_task(_refresh_loop())
     history_task = asyncio.create_task(_history_loop())
+    quotes_task = asyncio.create_task(_quote_poll_loop())
     try:
         yield
     finally:
         symbols_task.cancel()
         history_task.cancel()
+        quotes_task.cancel()
         if _pool is not None:
             _pool.close()
 
@@ -341,15 +358,18 @@ def _is_allowed(symbol: str) -> bool:
     return symbol in _symbols
 
 
-def _fetch(symbol: str) -> dict:
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period="5d", interval="1d")
-    if hist.empty:
-        raise ValueError(f"no data returned for {symbol}")
-
-    closes = [round(float(v), 4) for v in hist["Close"] if not math.isnan(v)]
+def _build_quote(symbol: str, raw_closes) -> dict:
+    """Build the /stock payload from a raw Close series (list/Series). Shared
+    by the single-symbol fetch and the batch poller so both produce the exact
+    same shape."""
+    closes = [
+        round(float(v), 4)
+        for v in raw_closes
+        if v is not None and not (isinstance(v, float) and math.isnan(v))
+    ]
     if len(closes) < 2:
         raise ValueError(f"not enough data points for {symbol}")
+    closes = closes[-5:]
 
     last = closes[-1]
     prev = closes[-2]
@@ -364,6 +384,87 @@ def _fetch(symbol: str) -> dict:
         "change":     change,
         "change_pct": change_pct,
     }
+
+
+def _fetch(symbol: str) -> dict:
+    hist = yf.Ticker(symbol).history(period="5d", interval="1d")
+    if hist.empty:
+        raise ValueError(f"no data returned for {symbol}")
+    return _build_quote(symbol, list(hist["Close"]))
+
+
+def _fetch_batch(symbols: list[str]) -> dict[str, dict]:
+    """Fetch quotes for many symbols in a single Yahoo round-trip (yfinance
+    batches them internally). Returns {symbol: payload} for the symbols that
+    came back with usable data; missing/invalid symbols are simply absent."""
+    if not symbols:
+        return {}
+    df = yf.download(
+        symbols,
+        period="5d",
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+    out: dict[str, dict] = {}
+    for sym in symbols:
+        try:
+            closes = list(df[sym]["Close"])
+        except Exception:
+            continue
+        try:
+            out[sym] = _build_quote(sym, closes)
+        except Exception:
+            continue
+    return out
+
+
+def _mark_active(symbol: str) -> None:
+    _active[symbol] = datetime.utcnow()
+
+
+def _active_symbols() -> list[str]:
+    """Most-recently-requested symbols still inside the active window, capped
+    at QUOTE_MAX_ACTIVE. Prunes stale entries as a side effect."""
+    cutoff = datetime.utcnow() - timedelta(seconds=QUOTE_ACTIVE_WINDOW)
+    for sym in [s for s, t in _active.items() if t < cutoff]:
+        _active.pop(sym, None)
+    ordered = sorted(_active.items(), key=lambda kv: kv[1], reverse=True)
+    return [s for s, _ in ordered[:QUOTE_MAX_ACTIVE]]
+
+
+def _poll_quotes_sync() -> None:
+    """Refresh the active working set into the live-quote cache, in batches."""
+    global _quote_poll_at, _quote_poll_ok
+    symbols = _active_symbols()
+    if not symbols:
+        _quote_poll_at = datetime.utcnow()
+        return
+    fetched = 0
+    for i in range(0, len(symbols), QUOTE_BATCH_SIZE):
+        batch = symbols[i:i + QUOTE_BATCH_SIZE]
+        try:
+            quotes = _fetch_batch(batch)
+        except Exception:
+            quotes = {}
+        now = datetime.utcnow()
+        for sym, data in quotes.items():
+            _cache[sym] = {"ts": now, "data": data}
+            fetched += 1
+    _quote_poll_at = datetime.utcnow()
+    _quote_poll_ok = fetched > 0
+
+
+async def _quote_poll_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_poll_quotes_sync)
+        except Exception:
+            pass
+        delay = QUOTE_POLL_SECONDS if _is_market_open() else QUOTE_POLL_CLOSED_SECONDS
+        await asyncio.sleep(delay)
 
 
 def _get_cached(symbol: str) -> dict | None:
@@ -549,6 +650,10 @@ def health():
         "hot_symbols": list(_hot.keys()),
         "hot_max": HISTORY_MAX_HOT,
         "tick_seconds": HISTORY_TICK_SECONDS,
+        "active_symbols": len(_active),
+        "quote_poll_seconds": QUOTE_POLL_SECONDS,
+        "quote_poll_at": _quote_poll_at.isoformat() if _quote_poll_at else None,
+        "quote_poll_ok": _quote_poll_ok,
         "market_open": _is_market_open(),
     }
 
@@ -562,6 +667,7 @@ def get_stock(symbol: str, authorization: str = Header(default="")):
         raise HTTPException(status_code=400, detail=f"unknown symbol: {symbol}")
 
     _mark_hot(symbol)
+    _mark_active(symbol)
 
     fresh = _get_cached(symbol)
     if fresh:

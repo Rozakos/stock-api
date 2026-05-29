@@ -18,6 +18,12 @@ ESP8266 ──HTTPS──▶ Cloudflare ──tunnel──▶ stock-api (FastAPI
   rejected at the API edge before any yfinance call.
 - **Live cache** — 10-minute in-memory cache. On yfinance failure, falls back
   to stale cache rather than 502'ing, so the device never blanks out.
+- **Quote poller** — a background task refreshes the *active working set*
+  (every symbol requested in the last 15 min) in batches, once a minute while
+  the market is open. Device `/stock` requests serve from the cache the poller
+  fills, so upstream Yahoo load is bounded by the number of distinct symbols,
+  not the number of devices — 500 devices on 500 symbols is ~5 Yahoo requests
+  per minute, the same as 50,000 devices would be. See [Scaling](#scaling).
 - **1-minute history** — for the 8 most-recently-requested symbols (LRU),
   one row per minute bar is written to Postgres during US regular trading
   hours, retained 30 days. Queryable via `GET /history/{symbol}?days=N`.
@@ -216,9 +222,17 @@ No auth. Useful for uptime checks and seeing service state:
   "hot_symbols": ["AMD", "NVDA"],
   "hot_max": 8,
   "tick_seconds": 60,
+  "active_symbols": 137,
+  "quote_poll_seconds": 60,
+  "quote_poll_at": "2026-05-14T16:08:12.114390",
+  "quote_poll_ok": true,
   "market_open": true
 }
 ```
+
+`active_symbols` is the size of the quote poller's working set; `quote_poll_at`
+/ `quote_poll_ok` are the timestamp and result of its last run (handy for
+alerting if the poller stalls).
 
 ## Setup
 
@@ -263,6 +277,11 @@ If you're fronting with nginx instead, see `nginx.conf.snippet`.
 | `HISTORY_TICK_SECONDS` | 60 | How often to record minute bars. |
 | `HISTORY_RETENTION_DAYS` | 30 | Older rows are pruned on each tick. |
 | `HISTORY_MAX_HOT` | 8 | LRU cap on archived symbols. Hitting `/stock/{X}` bumps `X` to the front; oldest is evicted when full. |
+| `QUOTE_POLL_SECONDS` | 60 | How often the quote poller refreshes the active set while the market is open. |
+| `QUOTE_POLL_CLOSED_SECONDS` | 300 | Poll interval while the market is closed. |
+| `QUOTE_ACTIVE_WINDOW_SECONDS` | 900 | A symbol stays in the poller's working set this long after it was last requested. |
+| `QUOTE_MAX_ACTIVE` | 1000 | Cap on the working set. The most recently requested symbols win; the rest fall back to on-demand fetch. |
+| `QUOTE_BATCH_SIZE` | 100 | Symbols per `yf.download` batch (one Yahoo round-trip). |
 | `LOGO_CACHE_DIR` | `data/logos` | Where resolved logos are stored as 64×64 PNGs. Relative paths are resolved from the project root. |
 | `LOGO_OVERRIDES_FILE` | `logo_sources.json` | JSON map of `TICKER -> logo URL` to override the auto-resolution chain. |
 
@@ -291,10 +310,41 @@ User-Agent, calls the API, renders the same fields the OLED draws.
 - DB: rows live in `prices(symbol TEXT, ts TIMESTAMPTZ, last DOUBLE PRECISION)`
   with a `(symbol, ts DESC)` index. Created on first startup.
 
+## Scaling
+
+The thing that breaks first under many devices is **upstream Yahoo load**, not
+serving. On-demand fetching makes one Yahoo call per cache miss, so N devices
+on N symbols means N fetches per cache cycle — which both stampedes (no
+per-symbol lock on the quote path) and risks Yahoo rate-limiting/IP-banning the
+server. Serving itself is cheap: in-memory cache reads handle thousands/sec.
+
+The **quote poller** flips this from pull to push: a background task refreshes
+the active working set on a timer and device requests just read the cache it
+fills. Consequences:
+
+- **Yahoo load is decoupled from device count.** It scales with the number of
+  *distinct symbols*, not devices. 500 symbols at `QUOTE_BATCH_SIZE=100` is
+  ~5 Yahoo requests/minute, constant, whether 500 or 50,000 devices ask.
+- **No stampede / no thread-pool blocking** on the request path — requests are
+  in-memory reads.
+- A brand-new symbol's first request still falls back to an on-demand fetch;
+  the poller picks it up on the next cycle.
+
+Two deliberate boundaries:
+
+- **`/history` ranges stay on-demand** with their per-range cache TTLs. Long
+  windows (`1y`, `max`) don't change minute-to-minute, so they don't belong on
+  the 1-minute poller. Use `&limit=N` to keep those responses small for
+  constrained clients.
+- The poller is a **single point of staleness** — if it stalls, quotes freeze.
+  The stale-serve fallback covers brief gaps; watch `quote_poll_at` /
+  `quote_poll_ok` in `/health` for anything longer.
+
 ## Tests
 
 A smoke test in `tests/` exercises every `range=` value against the live
-service plus a couple of regression checks.
+service plus a couple of regression checks. `tests/test_quotes.py` unit-tests
+the quote payload builder and the active-set registry offline (no network).
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
