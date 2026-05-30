@@ -151,27 +151,45 @@ On a miss, the server resolves the logo on the fly through this chain:
 
 1. Manual override in `logo_sources.json` — `{ "IONQ": "https://..." }`.
    Useful for symbols where auto-resolution returns something wrong or
-   ugly.
+   ugly. An override is trusted and short-circuits the yfinance lookup.
 2. The company website from `yfinance.Ticker(symbol).info["website"]`,
    resolved to a logo via DuckDuckGo's `icons.duckduckgo.com/ip3/{domain}.ico`
-   (highest-quality), with Google's `s2/favicons?domain={domain}&sz=128`
-   as a universal fallback.
-3. If all sources fail, the symbol is remembered as a "miss" for 24h to
-   avoid retry storms, and the endpoint returns `404 {"detail": "no
-   logo for X"}`.
+   and Google's `s2/favicons?domain={domain}&sz=256`. Both candidates are
+   fetched and the one that decodes to the **largest native resolution**
+   wins (rather than first-hit), and for multi-size `.ico` files the largest
+   embedded frame is selected.
+3. If the best logo found is unusably small (native max-dimension below
+   `LOGO_MIN_NATIVE`, default 32px), a clean **monogram** is generated
+   instead — a rounded tile in a deterministic per-symbol color with the
+   ticker in white bold.
+4. If nothing resolves at all, the symbol is remembered as a "miss" for 24h
+   to avoid retry storms, and the endpoint returns `404 {"detail": "no
+   logo for X"}` (unchanged).
 
-Successful logos are written to `LOGO_CACHE_DIR` and served with
-`Cache-Control: public, max-age=2592000, immutable` so the device (and
-Cloudflare, if you configure it to ignore the auth header on this
-path) can cache aggressively.
+The resolved image is stored as a **high-resolution master** (the source's
+native resolution, capped at 256px, alpha-trimmed) in `LOGO_CACHE_DIR` as
+`{symbol}.png`. Keeping the master high-res means a small served size is a
+single clean downscale from the best available pixels, not a re-downscale of
+an already-shrunk 64px image.
 
-**`?size=` query parameter** — accepts `32`, `48`, or `64` (default
-`64`). Anything else returns `400`. `size=64` serves the cached file
-byte-identical; `size=32` and `size=48` resize the cached 64×64 PNG
-on-the-fly with LANCZOS, preserving the RGBA alpha channel. Useful for
-embedded clients with constrained transient heap during PNG decode —
-e.g. the ESP32 CYD firmware needs `?size=48` to keep lodepng's
-allocation inside its largest free block after WiFi+TLS.
+**`?size=` query parameter** — accepts `32`, `48`, or `64` (default `64`);
+anything else returns `400`. Each size is rendered **once** from the master
+in a single premultiplied-alpha Lanczos downscale — premultiplication keeps
+semi-transparent edges true to the logo's color instead of bleeding toward
+black (no dark halos) — centered on a transparent square at
+`LOGO_CONTENT_RATIO` (94%) fill, encoded as an optimized RGBA PNG (typically
+1–3 KB). The result is cached per `(symbol, size)` on disk as
+`{symbol}.{size}.png` and served with
+`Cache-Control: public, max-age=2592000, immutable`, so the device (and
+Cloudflare, if you configure it to ignore the auth header on this path) can
+cache aggressively. The ESP32 CYD firmware uses `?size=48` to keep lodepng's
+allocation inside its largest free block after WiFi+TLS; sizes never exceed
+64px so the device's PNG-decode memory budget is respected.
+
+> **Changing the pipeline?** The master and per-size variants are cached on
+> disk and never auto-invalidated. After changing resolution/resize logic,
+> clear the cache so logos rebuild: `rm -f "$LOGO_CACHE_DIR"/*.png` (see
+> "pre-warm" below). Existing low-res masters otherwise keep being served.
 
 **`?test=1` diagnostic mode** — bypasses the resolver and cache and
 returns a synthetic 64×64 RGBA PNG (red background, green diagonal,
@@ -284,6 +302,7 @@ If you're fronting with nginx instead, see `nginx.conf.snippet`.
 | `QUOTE_BATCH_SIZE` | 100 | Symbols per `yf.download` batch (one Yahoo round-trip). |
 | `LOGO_CACHE_DIR` | `data/logos` | Where resolved logos are stored as 64×64 PNGs. Relative paths are resolved from the project root. |
 | `LOGO_OVERRIDES_FILE` | `logo_sources.json` | JSON map of `TICKER -> logo URL` to override the auto-resolution chain. |
+| `LOGO_MIN_NATIVE` | 32 | If the best resolved logo's native max-dimension is below this, serve a generated monogram instead. |
 
 The on-disk file `symbols.cache.json` stores the last fetched symbol universe
 so restarts don't depend on the network. It's gitignored and self-heals on

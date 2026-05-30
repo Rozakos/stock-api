@@ -11,7 +11,7 @@ from io import BytesIO
 
 import pytest
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import main
 
@@ -37,8 +37,9 @@ def _alpha_bbox(img: Image.Image) -> tuple[int, int, int, int]:
     return bbox
 
 
-def _normalized_img(data: bytes) -> Image.Image:
-    return Image.open(BytesIO(main._normalize_to_png(data))).convert("RGBA")
+def _normalized_img(data: bytes, size: int = 64) -> Image.Image:
+    src = Image.open(BytesIO(data)).convert("RGBA")
+    return Image.open(BytesIO(main._fit_square(src, size))).convert("RGBA")
 
 
 @pytest.fixture
@@ -94,7 +95,7 @@ def test_symbol_is_uppercased(client, monkeypatch, tmp_path):
         seen.append(sym)
         return _png_bytes()
 
-    monkeypatch.setattr(main, "_resolve_logo_sync", fake_resolve)
+    monkeypatch.setattr(main, "_resolve_master_sync", fake_resolve)
     r = client.get("/stocks/api/v1/logo/ionq")
     assert r.status_code == 200, r.text
     assert seen == ["IONQ"]
@@ -109,17 +110,21 @@ def test_cached_logo_served_without_refetching(client, monkeypatch, tmp_path):
     called: list[str] = []
     monkeypatch.setattr(
         main,
-        "_resolve_logo_sync",
+        "_resolve_master_sync",
         lambda s: called.append(s) or None,
     )
     r = client.get("/stocks/api/v1/logo/AAPL")
     assert r.status_code == 200
     assert called == [], "should not invoke resolver for cached logo"
-    assert r.content == (tmp_path / "AAPL.png").read_bytes()
+    # Served size is now derived from the (high-res) master, not the raw master
+    # bytes; the point is no re-resolution happened.
+    img = Image.open(BytesIO(r.content))
+    assert img.size == (64, 64)
+    assert img.mode == "RGBA"
 
 
 def test_missing_logo_returns_404_json(client, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "_resolve_logo_sync", lambda s: None)
+    monkeypatch.setattr(main, "_resolve_master_sync", lambda s: None)
     r = client.get("/stocks/api/v1/logo/NOPE")
     assert r.status_code == 404
     body = r.json()
@@ -181,15 +186,18 @@ def test_size_param_returns_resized_png(client, tmp_path):
     assert img.mode == "RGBA"
 
 
-def test_size_64_is_byte_identical_to_default(client, tmp_path):
+def test_size_64_matches_default(client, tmp_path):
     raw = _png_bytes((10, 200, 50, 255), size=64)
     (tmp_path / "AAPL.png").write_bytes(raw)
     default = client.get("/stocks/api/v1/logo/AAPL")
     sized = client.get("/stocks/api/v1/logo/AAPL", params={"size": 64})
     assert default.status_code == 200
     assert sized.status_code == 200
-    assert default.content == raw
-    assert sized.content == raw
+    # default size is 64, so both paths render the same 64px variant
+    assert default.content == sized.content
+    img = Image.open(BytesIO(default.content))
+    assert img.size == (64, 64)
+    assert img.mode == "RGBA"
 
 
 def test_size_rejects_unsupported_values(client, tmp_path):
@@ -203,7 +211,7 @@ def test_test_mode_returns_synthetic_png(client, monkeypatch, tmp_path):
     def must_not_be_called(symbol: str) -> bytes | None:
         raise AssertionError(f"resolver should not be called in test mode; got {symbol}")
 
-    monkeypatch.setattr(main, "_resolve_logo_sync", must_not_be_called)
+    monkeypatch.setattr(main, "_resolve_master_sync", must_not_be_called)
     r = client.get("/stocks/api/v1/logo/ASML", params={"test": 1})
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "image/png"
@@ -227,7 +235,82 @@ def test_miss_marker_short_circuits_retries(client, monkeypatch, tmp_path):
         calls.append(sym)
         return None
 
-    monkeypatch.setattr(main, "_resolve_logo_sync", fake)
+    monkeypatch.setattr(main, "_resolve_master_sync", fake)
     assert client.get("/stocks/api/v1/logo/WAT").status_code == 404
     assert client.get("/stocks/api/v1/logo/WAT").status_code == 404
     assert calls == ["WAT"], "second hit must read miss marker, not re-resolve"
+
+
+# --- quality of the master / resize / fallback -----------------------------
+
+def _semi_alpha_dark_count(img: Image.Image, rgb_floor: int = 180) -> tuple[int, int]:
+    """(semi-transparent pixels, of those that bled darker than rgb_floor)."""
+    px = img.convert("RGBA").load()
+    semi = dark = 0
+    for y in range(img.height):
+        for x in range(img.width):
+            r, g, b, a = px[x, y]
+            if 0 < a < 250:
+                semi += 1
+                if min(r, g, b) < rgb_floor:
+                    dark += 1
+    return semi, dark
+
+
+def test_master_keeps_high_res_source(monkeypatch):
+    big = Image.new("RGBA", (200, 200), (12, 200, 90, 255))
+    monkeypatch.setattr(main, "_best_source_image", lambda s: big)
+    master = Image.open(BytesIO(main._resolve_master_sync("AAA"))).convert("RGBA")
+    # source <= 256, so it's preserved (not crushed down to 64 like before)
+    assert max(master.size) == 200
+
+
+def test_master_caps_at_256(monkeypatch):
+    huge = Image.new("RGBA", (512, 512), (200, 50, 50, 255))
+    monkeypatch.setattr(main, "_best_source_image", lambda s: huge)
+    master = Image.open(BytesIO(main._resolve_master_sync("AAA"))).convert("RGBA")
+    assert max(master.size) == main.LOGO_MASTER_SIZE  # 256
+
+
+def test_best_source_picks_largest(monkeypatch):
+    small = Image.new("RGBA", (48, 48), (0, 0, 0, 255))
+    large = Image.new("RGBA", (192, 192), (0, 0, 0, 255))
+    monkeypatch.setattr(main, "_logo_overrides", {})
+    monkeypatch.setattr(main, "_ticker_domain", lambda s: "example.com")
+    seq = iter([small, large])
+    monkeypatch.setattr(main, "_fetch_image", lambda url: next(seq))
+    best = main._best_source_image("AAA")
+    assert max(best.size) == 192  # largest native wins, not first-hit
+
+
+def test_premultiplied_resize_has_no_dark_halo():
+    # opaque white disc on transparent (RGB 0). Downscaling creates
+    # semi-transparent edge pixels; with premultiplied alpha they must stay
+    # white instead of bleeding toward the black transparent background.
+    src = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+    ImageDraw.Draw(src).ellipse([8, 8, 192, 192], fill=(255, 255, 255, 255))
+    out = Image.open(BytesIO(main._fit_square(src, 48))).convert("RGBA")
+    semi, dark = _semi_alpha_dark_count(out)
+    assert semi > 0, "expected antialiased edge pixels from the downscale"
+    assert dark == 0, f"{dark}/{semi} edge pixels bled toward black (halo)"
+
+
+def test_monogram_when_source_too_small(monkeypatch):
+    tiny = Image.new("RGBA", (16, 16), (255, 255, 255, 255))
+    monkeypatch.setattr(main, "_best_source_image", lambda s: tiny)
+    master = Image.open(BytesIO(main._resolve_master_sync("XY"))).convert("RGBA")
+    assert master.size == (main.LOGO_MASTER_SIZE, main.LOGO_MASTER_SIZE)
+    # the monogram tile has opaque pixels (a real drawn mark, not blank)
+    assert master.getextrema()[3][1] == 255
+
+
+def test_size_variant_is_cached_per_size(client, tmp_path, monkeypatch):
+    (tmp_path / "AAPL.png").write_bytes(_png_bytes((10, 200, 50, 255), size=200))
+    r1 = client.get("/stocks/api/v1/logo/AAPL", params={"size": 48})
+    assert r1.status_code == 200
+    variant = tmp_path / "AAPL.48.png"
+    assert variant.exists(), "per-(symbol,size) variant should be cached on disk"
+    # second request serves the cached variant verbatim, single-digit KB
+    r2 = client.get("/stocks/api/v1/logo/AAPL", params={"size": 48})
+    assert r2.content == variant.read_bytes()
+    assert len(r2.content) < 8000

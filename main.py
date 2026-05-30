@@ -17,7 +17,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from psycopg_pool import ConnectionPool
 
 load_dotenv()
@@ -59,10 +59,16 @@ LOGO_CACHE_DIR = Path(
 LOGO_OVERRIDES_FILE = Path(
     os.getenv("LOGO_OVERRIDES_FILE", str(Path(__file__).parent / "logo_sources.json"))
 )
-LOGO_SIZE = 64
+LOGO_SIZE = 64                  # default served size (route contract)
+LOGO_MASTER_SIZE = 256          # high-res master kept on disk (best source pixels)
+LOGO_CONTENT_RATIO = 0.94       # fraction of the square the logo content fills
+LOGO_MIN_NATIVE = int(os.getenv("LOGO_MIN_NATIVE", "32"))  # below this -> monogram
 LOGO_MISS_TTL = 24 * 3600
 LOGO_USER_AGENT = "stock-api-logo/1.0 (+https://rozakos.eu)"
-LOGO_CONTENT_SIZE = 60
+LOGO_FONT_CANDIDATES = (
+    "DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+)
 
 try:
     _LANCZOS = Image.Resampling.LANCZOS
@@ -506,6 +512,23 @@ def _logo_paths(symbol: str) -> tuple[Path, Path]:
     return LOGO_CACHE_DIR / f"{symbol}.png", LOGO_CACHE_DIR / f"{symbol}.miss.json"
 
 
+def _logo_size_path(symbol: str, size: int) -> Path:
+    """Per-(symbol, size) rendered variant, derived from the master in one
+    clean downscale and cached on disk."""
+    LOGO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return LOGO_CACHE_DIR / f"{symbol}.{size}.png"
+
+
+def _clear_logo_variants(symbol: str) -> None:
+    """Drop cached per-size variants so they get re-derived from a freshly
+    (re)built master."""
+    for variant in LOGO_CACHE_DIR.glob(f"{symbol}.*.png"):
+        try:
+            variant.unlink()
+        except OSError:
+            pass
+
+
 def _logo_miss_fresh(miss: Path) -> bool:
     if not miss.exists():
         return False
@@ -543,79 +566,161 @@ def _http_get(url: str, timeout: int = 10) -> bytes:
         return resp.read()
 
 
-def _normalize_to_png(
-    data: bytes,
-    size: int = LOGO_SIZE,
-    max_content_size: int = LOGO_CONTENT_SIZE,
-) -> bytes:
-    img = Image.open(BytesIO(data))
-    img.load()
-    img = img.convert("RGBA")
+def _resize_rgba(img: Image.Image, target: tuple[int, int]) -> Image.Image:
+    """Resample RGBA with **premultiplied alpha** so semi-transparent edges
+    don't bleed toward the (black) transparent background — i.e. no dark
+    halos. Pillow's 'RGBa' mode is premultiplied; round-trip through it."""
+    if img.size == target:
+        return img
+    return img.convert("RGBa").resize(target, _LANCZOS).convert("RGBA")
+
+
+def _autocrop_alpha(img: Image.Image) -> Image.Image:
+    """Trim fully/near-transparent margins so the logo content fills the frame
+    consistently regardless of the source's own padding."""
     alpha = img.getchannel("A")
-    content_mask = alpha.point(lambda a: 255 if a > 8 else 0)
-    bbox = content_mask.getbbox()
-    if bbox:
-        img = img.crop(bbox)
-    scale = min(max_content_size / img.width, max_content_size / img.height)
-    target = (
-        max(1, round(img.width * scale)),
-        max(1, round(img.height * scale)),
-    )
-    img = img.resize(target, _LANCZOS)
+    bbox = alpha.point(lambda a: 255 if a > 8 else 0).getbbox()
+    return img.crop(bbox) if bbox else img
+
+
+def _fit_square(img: Image.Image, size: int) -> bytes:
+    """Center the (already RGBA) logo on a transparent size×size canvas,
+    content scaled to LOGO_CONTENT_RATIO via a single premultiplied Lanczos
+    step, encoded as an optimized small RGBA PNG."""
+    img = _autocrop_alpha(img.convert("RGBA"))
+    content = max(1, round(size * LOGO_CONTENT_RATIO))
+    scale = min(content / img.width, content / img.height)
+    target = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+    img = _resize_rgba(img, target)
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     ox = (size - img.width) // 2
     oy = (size - img.height) // 2
-    canvas.paste(img, (ox, oy), img)
+    canvas.paste(img, (ox, oy))  # no mask: copy RGBA verbatim, no compositing
     buf = BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 
-def _try_source(url: str) -> bytes | None:
+def _decode_image(raw: bytes) -> Image.Image | None:
+    """Decode bytes to RGBA, selecting the largest frame for multi-size ICOs
+    (favicon .ico files often pack 16/32/48/.../256 in one file)."""
+    if not raw:
+        return None
+    try:
+        img = Image.open(BytesIO(raw))
+        if getattr(img, "format", None) == "ICO":
+            try:
+                sizes = img.ico.sizes()
+                if sizes:
+                    img.size = max(sizes)
+            except Exception:
+                pass
+        return img.convert("RGBA")
+    except Exception:
+        return None
+
+
+def _fetch_image(url: str) -> Image.Image | None:
     try:
         raw = _http_get(url)
     except Exception:
         return None
-    if not raw:
-        return None
-    try:
-        return _normalize_to_png(raw)
-    except Exception:
-        return None
+    return _decode_image(raw)
 
 
 def _domain_logo_sources(domain: str) -> list[str]:
-    """Public favicon/logo sources that take a bare domain and return an
-    image. DuckDuckGo's ip3 endpoint usually returns the highest-quality
-    icon (often a real logo); Google's s2 endpoint is the universal
-    fallback that always returns *something*.
-    """
+    """Public sources that take a bare domain and return an image. DuckDuckGo's
+    ip3 endpoint serves the site's real icon (often up to 256px); Google's s2
+    endpoint at sz=256 is the universal fallback. We request the largest each
+    can give and then pick whichever decodes biggest."""
     return [
         f"https://icons.duckduckgo.com/ip3/{domain}.ico",
-        f"https://www.google.com/s2/favicons?domain={domain}&sz=128",
+        f"https://www.google.com/s2/favicons?domain={domain}&sz=256",
     ]
 
 
-def _resolve_logo_sync(symbol: str) -> bytes | None:
-    """Try each source in order, short-circuiting on first success.
-
-    Order: manual override → yfinance .info website (via DuckDuckGo, then
-    Google s2). Sources are tried lazily — yfinance is only consulted if
-    the override is missing or fails, since .info round-trips to Yahoo
-    and is slow.
-    """
+def _best_source_image(symbol: str) -> Image.Image | None:
+    """Resolve the highest-resolution logo we can find: manual override +
+    every domain source, decoded, with the **largest native** one winning
+    (instead of first-success). Returns None if nothing resolves."""
+    # A manual override is an explicit choice — trust it and skip the slow
+    # yfinance .info round-trip entirely.
     override = _logo_overrides.get(symbol)
     if override:
-        png = _try_source(override)
-        if png:
-            return png
+        img = _fetch_image(override)
+        if img is not None:
+            return img
     domain = _ticker_domain(symbol)
-    if domain:
-        for url in _domain_logo_sources(domain):
-            png = _try_source(url)
-            if png:
-                return png
-    return None
+    if not domain:
+        return None
+    candidates = [
+        img
+        for url in _domain_logo_sources(domain)
+        if (img := _fetch_image(url)) is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda im: max(im.size))
+
+
+def _load_font(px: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for name in LOGO_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(name, px)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _monogram_master(symbol: str) -> bytes:
+    """Clean lettermark fallback rendered at master resolution: a rounded tile
+    in a deterministic per-symbol color with the ticker in white bold. Drawn
+    big and antialiased so the per-size downscale stays smooth, alpha is clean
+    (rounded corners transparent, no matte)."""
+    size = LOGO_MASTER_SIZE
+    text = symbol[:4] if len(symbol) <= 4 else symbol[:3]
+    hue = (hash(symbol) % 360)
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    fill = Image.new("HSV", (1, 1), (int(hue / 360 * 255), 150, 150)).convert("RGB").getpixel((0, 0))
+    draw = ImageDraw.Draw(img)
+    radius = round(size * 0.18)
+    draw.rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=(*fill, 255))
+    font = _load_font(round(size * 0.5))
+    # shrink the font until the text fits within ~80% of the tile
+    while font.size > 8:
+        box = draw.textbbox((0, 0), text, font=font)
+        if (box[2] - box[0]) <= size * 0.8 and (box[3] - box[1]) <= size * 0.8:
+            break
+        font = _load_font(font.size - 4)
+    box = draw.textbbox((0, 0), text, font=font)
+    tx = (size - (box[2] - box[0])) / 2 - box[0]
+    ty = (size - (box[3] - box[1])) / 2 - box[1]
+    draw.text((tx, ty), text, font=font, fill=(255, 255, 255, 255))
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _resolve_master_sync(symbol: str) -> bytes | None:
+    """Build the on-disk master PNG: best available source, downscaled to at
+    most LOGO_MASTER_SIZE (never upscaled), alpha-trimmed and premultiplied.
+    Falls back to a monogram only when a logo resolves but is unusably small;
+    returns None when nothing resolves (preserving the 404/miss path)."""
+    img = _best_source_image(symbol)
+    if img is None:
+        return None
+    img = _autocrop_alpha(img)
+    if max(img.size) < LOGO_MIN_NATIVE:
+        return _monogram_master(symbol)
+    longest = max(img.size)
+    if longest > LOGO_MASTER_SIZE:
+        scale = LOGO_MASTER_SIZE / longest
+        img = _resize_rgba(
+            img, (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        )
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 async def _ensure_logo(symbol: str) -> Path | None:
@@ -629,9 +734,10 @@ async def _ensure_logo(symbol: str) -> Path | None:
             return img_path
         if _logo_miss_fresh(miss_path):
             return None
-        png = await asyncio.to_thread(_resolve_logo_sync, symbol)
+        png = await asyncio.to_thread(_resolve_master_sync, symbol)
         if png:
             img_path.write_bytes(png)
+            _clear_logo_variants(symbol)  # stale per-size renders -> rebuild
             miss_path.unlink(missing_ok=True)
             return img_path
         miss_path.write_text(json.dumps({"ts": datetime.utcnow().timestamp()}))
@@ -934,18 +1040,17 @@ async def get_logo(
     path = await _ensure_logo(symbol)
     if path is None:
         raise HTTPException(status_code=404, detail=f"no logo for {symbol}")
-    if size == LOGO_SIZE:
-        return FileResponse(
-            path,
-            media_type="image/png",
-            headers={"Cache-Control": "public, max-age=2592000, immutable"},
-        )
-    with Image.open(path) as src:
-        img = src.convert("RGBA").resize((size, size), _LANCZOS)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return Response(
-        content=buf.getvalue(),
+    # Derive (and cache) the requested size from the high-res master in one
+    # clean premultiplied downscale; serve the per-(symbol,size) file.
+    out_path = _logo_size_path(symbol, size)
+    if not out_path.exists():
+        async with _logo_lock(symbol):
+            if not out_path.exists():
+                with Image.open(path) as src:
+                    png = await asyncio.to_thread(_fit_square, src.convert("RGBA"), size)
+                out_path.write_bytes(png)
+    return FileResponse(
+        out_path,
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=2592000, immutable"},
     )
