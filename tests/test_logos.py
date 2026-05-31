@@ -133,6 +133,20 @@ def test_missing_logo_returns_404_json(client, monkeypatch, tmp_path):
     assert (tmp_path / "NOPE.miss.json").exists()
 
 
+def test_override_relative_path_resolved_to_repo_file_uri(tmp_path, monkeypatch):
+    import json
+    f = tmp_path / "src.json"
+    f.write_text(json.dumps({
+        "FOO": "logo_overrides/NVDA.png",   # scheme-less -> repo-relative file://
+        "BAR": "https://example.test/y.png",  # has scheme -> verbatim
+    }))
+    monkeypatch.setattr(main, "LOGO_OVERRIDES_FILE", f)
+    ov = main._load_logo_overrides()
+    assert ov["BAR"] == "https://example.test/y.png"
+    assert ov["FOO"].startswith("file://")
+    assert ov["FOO"].endswith("/logo_overrides/NVDA.png")
+
+
 def test_override_bypasses_yfinance(client, monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_logo_overrides", {"IONQ": "https://example.test/ionq.png"})
     fetched: list[str] = []

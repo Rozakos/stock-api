@@ -490,11 +490,18 @@ def _load_logo_overrides() -> dict[str, str]:
         raw = json.loads(LOGO_OVERRIDES_FILE.read_text())
     except Exception:
         return {}
-    return {
-        k.upper(): v
-        for k, v in raw.items()
-        if isinstance(k, str) and isinstance(v, str) and v
-    }
+    base = Path(__file__).parent
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if not (isinstance(k, str) and isinstance(v, str) and v):
+            continue
+        # A scheme-less value is a repo-relative path to a curated logo asset
+        # committed alongside the code; resolve it to a file:// URL so the
+        # normal override fetch path can read it. Values with a scheme
+        # (http(s)://, file://) are used verbatim.
+        url = v if "://" in v else (base / v).resolve().as_uri()
+        out[k.upper()] = url
+    return out
 
 
 _logo_overrides = _load_logo_overrides()

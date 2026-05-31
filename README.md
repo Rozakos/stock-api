@@ -151,7 +151,11 @@ On a miss, the server resolves the logo on the fly through this chain:
 
 1. Manual override in `logo_sources.json` — `{ "IONQ": "https://..." }`.
    Useful for symbols where auto-resolution returns something wrong or
-   ugly. An override is trusted and short-circuits the yfinance lookup.
+   ugly (e.g. a halftone/dotted favicon). An override is trusted and
+   short-circuits the yfinance lookup. A value may be a full URL
+   (`http(s)://`, `file://`) or a **repo-relative path** to a committed
+   asset (e.g. `"NVDA": "logo_overrides/NVDA.png"`) — handy for pinning a
+   clean high-res brand mark that won't change out from under you.
 2. The company website from `yfinance.Ticker(symbol).info["website"]`,
    resolved to a logo via DuckDuckGo's `icons.duckduckgo.com/ip3/{domain}.ico`
    and Google's `s2/favicons?domain={domain}&sz=256`. Both candidates are
