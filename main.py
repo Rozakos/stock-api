@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -68,6 +69,16 @@ LOGO_USER_AGENT = "stock-api-logo/1.0 (+https://rozakos.eu)"
 LOGO_FONT_CANDIDATES = (
     "DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+)
+
+# Brandfetch Logo Link: a domain-keyed CDN of clean high-res brand marks,
+# used as a high-quality source ahead of the favicon fallbacks. Inactive
+# unless BRANDFETCH_CLIENT_ID is set. We request the transparent 'symbol'
+# asset; for brands without one Brandfetch returns a fixed "B" placeholder,
+# whose sha256 we reject so it never leaks through.
+BRANDFETCH_CLIENT_ID = os.getenv("BRANDFETCH_CLIENT_ID", "")
+BRANDFETCH_PLACEHOLDER_SHA256 = (
+    "077ed4d7a4a1d611c41517cd5b42dda8e9cd5f447de690ccc497dd49f83d5de8"
 )
 
 try:
@@ -646,12 +657,33 @@ def _domain_logo_sources(domain: str) -> list[str]:
     ]
 
 
+def _brandfetch_symbol(domain: str) -> Image.Image | None:
+    """Brandfetch Logo Link 'symbol': a transparent, high-res brand mark keyed
+    by domain. Returns None when Brandfetch has no real symbol (it serves a
+    fixed "B" placeholder, matched by sha256) or when the asset is fully
+    opaque (a baked background — we keep the clean-alpha contract)."""
+    if not BRANDFETCH_CLIENT_ID:
+        return None
+    url = (f"https://cdn.brandfetch.io/{domain}/w/512/h/512/symbol"
+           f"?c={BRANDFETCH_CLIENT_ID}")
+    try:
+        raw = _http_get(url)
+    except Exception:
+        return None
+    if not raw or hashlib.sha256(raw).hexdigest() == BRANDFETCH_PLACEHOLDER_SHA256:
+        return None
+    img = _decode_image(raw)
+    if img is None or img.getchannel("A").getextrema()[0] > 250:
+        return None
+    return img
+
+
 def _best_source_image(symbol: str) -> Image.Image | None:
-    """Resolve the highest-resolution logo we can find: manual override +
-    every domain source, decoded, with the **largest native** one winning
-    (instead of first-success). Returns None if nothing resolves."""
-    # A manual override is an explicit choice — trust it and skip the slow
-    # yfinance .info round-trip entirely.
+    """Resolve the best logo we can find, in priority order: manual override,
+    then Brandfetch's transparent symbol, then the largest favicon. Returns
+    None if nothing resolves (caller then renders a monogram)."""
+    # A manual override is an explicit choice — trust it and skip everything
+    # else, including the slow yfinance .info round-trip.
     override = _logo_overrides.get(symbol)
     if override:
         img = _fetch_image(override)
@@ -660,6 +692,10 @@ def _best_source_image(symbol: str) -> Image.Image | None:
     domain = _ticker_domain(symbol)
     if not domain:
         return None
+    # Brandfetch (clean, high-res) is preferred over the favicon fallbacks.
+    bf = _brandfetch_symbol(domain)
+    if bf is not None:
+        return bf
     candidates = [
         img
         for url in _domain_logo_sources(domain)

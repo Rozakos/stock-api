@@ -156,17 +156,23 @@ On a miss, the server resolves the logo on the fly through this chain:
    (`http(s)://`, `file://`) or a **repo-relative path** to a committed
    asset (e.g. `"NVDA": "logo_overrides/NVDA.png"`) — handy for pinning a
    clean high-res brand mark that won't change out from under you.
-2. The company website from `yfinance.Ticker(symbol).info["website"]`,
+2. **Brandfetch** (if `BRANDFETCH_CLIENT_ID` is set) — the transparent
+   high-res `symbol` from Brandfetch's Logo Link CDN, keyed by the company
+   domain. This is the broad-coverage high-quality source for the whole
+   universe. Brandfetch serves a fixed "B" placeholder for brands with no
+   real symbol (rejected by sha256), and opaque assets are skipped to keep
+   the alpha clean — so a miss here falls through to the favicons below.
+3. The company website from `yfinance.Ticker(symbol).info["website"]`,
    resolved to a logo via DuckDuckGo's `icons.duckduckgo.com/ip3/{domain}.ico`
    and Google's `s2/favicons?domain={domain}&sz=256`. Both candidates are
    fetched and the one that decodes to the **largest native resolution**
    wins (rather than first-hit), and for multi-size `.ico` files the largest
    embedded frame is selected.
-3. If the best logo found is unusably small (native max-dimension below
+4. If the best logo found is unusably small (native max-dimension below
    `LOGO_MIN_NATIVE`, default 32px), a clean **monogram** is generated
    instead — a rounded tile in a deterministic per-symbol color with the
    ticker in white bold.
-4. If nothing resolves at all, the symbol is remembered as a "miss" for 24h
+5. If nothing resolves at all, the symbol is remembered as a "miss" for 24h
    to avoid retry storms, and the endpoint returns `404 {"detail": "no
    logo for X"}` (unchanged).
 
@@ -307,6 +313,7 @@ If you're fronting with nginx instead, see `nginx.conf.snippet`.
 | `LOGO_CACHE_DIR` | `data/logos` | Where resolved logos are stored as 64×64 PNGs. Relative paths are resolved from the project root. |
 | `LOGO_OVERRIDES_FILE` | `logo_sources.json` | JSON map of `TICKER -> logo URL` to override the auto-resolution chain. |
 | `LOGO_MIN_NATIVE` | 32 | If the best resolved logo's native max-dimension is below this, serve a generated monogram instead. |
+| `BRANDFETCH_CLIENT_ID` | (empty) | Brandfetch Logo Link client ID. If set, the transparent high-res Brandfetch symbol is used as a logo source ahead of the favicon fallbacks. |
 
 The on-disk file `symbols.cache.json` stores the last fetched symbol universe
 so restarts don't depend on the network. It's gitignored and self-heals on

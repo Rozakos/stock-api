@@ -271,6 +271,68 @@ def _semi_alpha_dark_count(img: Image.Image, rgb_floor: int = 180) -> tuple[int,
     return semi, dark
 
 
+def _rgba_png(color, size=512):
+    buf = BytesIO()
+    Image.new("RGBA", (size, size), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_brandfetch_preferred_over_favicon_when_keyed(monkeypatch):
+    monkeypatch.setattr(main, "_logo_overrides", {})
+    monkeypatch.setattr(main, "BRANDFETCH_CLIENT_ID", "k")
+    monkeypatch.setattr(main, "_ticker_domain", lambda s: "example.com")
+    # Brandfetch returns a transparent 512 symbol; _http_get feeds it raw.
+    monkeypatch.setattr(main, "_http_get", lambda url, timeout=10: _rgba_png((1, 2, 3, 128)))
+    monkeypatch.setattr(main, "_fetch_image",
+                        lambda url: Image.new("RGBA", (64, 64), (9, 9, 9, 255)))
+    best = main._best_source_image("AAA")
+    assert best.size == (512, 512)  # brandfetch wins over the 64px favicon
+
+
+def test_brandfetch_placeholder_rejected(monkeypatch):
+    monkeypatch.setattr(main, "_logo_overrides", {})
+    monkeypatch.setattr(main, "BRANDFETCH_CLIENT_ID", "k")
+    monkeypatch.setattr(main, "_ticker_domain", lambda s: "example.com")
+    placeholder = _rgba_png((0, 0, 0, 0))
+    import hashlib
+    monkeypatch.setattr(main, "BRANDFETCH_PLACEHOLDER_SHA256",
+                        hashlib.sha256(placeholder).hexdigest())
+    monkeypatch.setattr(main, "_http_get", lambda url, timeout=10: placeholder)
+    fav = Image.new("RGBA", (64, 64), (9, 9, 9, 255))
+    monkeypatch.setattr(main, "_fetch_image", lambda url: fav)
+    best = main._best_source_image("AAA")
+    assert best.size == (64, 64)  # placeholder ignored -> favicon used
+
+
+def test_brandfetch_opaque_rejected(monkeypatch):
+    monkeypatch.setattr(main, "_logo_overrides", {})
+    monkeypatch.setattr(main, "BRANDFETCH_CLIENT_ID", "k")
+    monkeypatch.setattr(main, "_ticker_domain", lambda s: "example.com")
+    monkeypatch.setattr(main, "_http_get", lambda url, timeout=10: _rgba_png((5, 5, 5, 255)))
+    fav = Image.new("RGBA", (80, 80), (9, 9, 9, 255))
+    monkeypatch.setattr(main, "_fetch_image", lambda url: fav)
+    best = main._best_source_image("AAA")
+    assert best.size == (80, 80)  # opaque brandfetch skipped -> favicon used
+
+
+def test_brandfetch_skipped_without_key(monkeypatch):
+    monkeypatch.setattr(main, "_logo_overrides", {})
+    monkeypatch.setattr(main, "BRANDFETCH_CLIENT_ID", "")
+    monkeypatch.setattr(main, "_ticker_domain", lambda s: "example.com")
+    calls: list[str] = []
+
+    def fake_http_get(url, timeout=10):
+        calls.append(url)
+        raise AssertionError("brandfetch must not be called without a key")
+
+    monkeypatch.setattr(main, "_http_get", fake_http_get)
+    monkeypatch.setattr(main, "_fetch_image",
+                        lambda url: Image.new("RGBA", (64, 64), (0, 0, 0, 255)))
+    best = main._best_source_image("AAA")
+    assert best.size == (64, 64)
+    assert calls == []
+
+
 def test_master_keeps_high_res_source(monkeypatch):
     big = Image.new("RGBA", (200, 200), (12, 200, 90, 255))
     monkeypatch.setattr(main, "_best_source_image", lambda s: big)
