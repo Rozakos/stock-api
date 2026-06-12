@@ -35,9 +35,10 @@ ESP8266 ──HTTPS──▶ Cloudflare ──tunnel──▶ stock-api (FastAPI
 
 ## API
 
-Base: `https://rozakos.eu/stocks/api/v1`. All `/stock` and `/history`
-requests require `Authorization: Bearer <token>`. Cloudflare bot-fight
-blocks empty/default User-Agents, so clients **must** send a non-empty UA.
+Base: `https://rozakos.eu/stocks/api/v1`. All `/stock`, `/stocks`, and
+`/history` requests require `Authorization: Bearer <token>`. Cloudflare
+bot-fight blocks empty/default User-Agents, so clients **must** send a
+non-empty UA.
 
 ### `GET /stock/{symbol}`
 
@@ -60,6 +61,35 @@ response).
 
 Status codes: `400` unknown symbol, `401` bad/missing bearer, `502` upstream
 Yahoo failure with no prior cache.
+
+### `GET /stocks?symbols=AMD,NVDA,AAPL`
+
+Batch quotes — one request instead of one per symbol. Built for the embedded
+ticker: it lets the client fetch its whole watchlist in a single round-trip,
+keeping the keep-alive connection free for history taps.
+
+```json
+{"quotes": [
+  {"symbol": "AMD", "last": 488.45, "change_pct": 7.97, "closes": [..]},
+  {"symbol": "NVDA", "last": 204.87, "change_pct": 2.22, "closes": [..]}
+]}
+```
+
+- Each entry carries the same field names/types as `/stock/{symbol}`:
+  `symbol`, `last`, `change_pct`, and the 5-point `closes` sparkline
+  (oldest→newest). No `cached`/`stale`/`prev`/`change` — kept minimal for
+  embedded buffers.
+- Served from the **same cache + background poller** as `/stock/{symbol}`;
+  every requested symbol joins the poller's active working set. Cache misses
+  are fetched in **one** batched Yahoo round-trip.
+- **Unknown or failed symbols are omitted** from `quotes` — one bad ticker
+  never fails the whole request. Order follows the request; duplicates and
+  case are normalized.
+- **Max 16 symbols**; more returns `400`. A 16-symbol response is ~1.5 KB
+  (well under a 24 KB client buffer). Plain compact `JSONResponse` with a
+  `Content-Length` header (no chunked transfer-encoding).
+
+Status codes: `400` empty or >16 symbols, `401` bad/missing bearer.
 
 ### `GET /history/{symbol}` — two modes
 

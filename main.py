@@ -834,6 +834,78 @@ def get_stock(symbol: str, authorization: str = Header(default="")):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+STOCKS_MAX_SYMBOLS = 16
+
+
+@app.get("/stocks/api/v1/stocks")
+def get_stocks(
+    symbols: str = Query(..., description="Comma-separated tickers, max 16."),
+    authorization: str = Header(default=""),
+):
+    """Batch quotes for an embedded client: one request instead of N. Each
+    entry has the same field names/types as /stock/{symbol} (symbol, last,
+    change_pct, closes). Served from the same cache/poller; every requested
+    symbol joins the poller's active set. Unknown/failed symbols are omitted
+    so one bad ticker never fails the whole request."""
+    _auth(authorization)
+
+    # Parse, uppercase, de-dupe while preserving request order.
+    requested: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols.split(","):
+        s = raw.strip().upper()
+        if s and s not in seen:
+            seen.add(s)
+            requested.append(s)
+    if not requested:
+        raise HTTPException(status_code=400, detail="no symbols provided")
+    if len(requested) > STOCKS_MAX_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many symbols (max {STOCKS_MAX_SYMBOLS}, got {len(requested)})",
+        )
+
+    by_symbol: dict[str, dict] = {}
+    pending: list[str] = []
+    for s in requested:
+        if not _is_allowed(s):
+            continue  # unknown symbol -> omitted from quotes
+        _mark_hot(s)
+        _mark_active(s)
+        fresh = _get_cached(s)
+        if fresh:
+            by_symbol[s] = fresh
+        else:
+            pending.append(s)
+
+    # One Yahoo round-trip for everything not already warm in the cache.
+    if pending:
+        try:
+            fetched = _fetch_batch(pending)
+        except Exception:
+            fetched = {}
+        now = datetime.utcnow()
+        for s, data in fetched.items():
+            _cache[s] = {"ts": now, "data": data}
+            by_symbol[s] = data
+        # Still missing? Fall back to stale cache if present, else omit.
+        for s in pending:
+            if s not in by_symbol and s in _cache:
+                by_symbol[s] = _cache[s]["data"]
+
+    quotes = [
+        {
+            "symbol":     s,
+            "last":       by_symbol[s]["last"],
+            "change_pct": by_symbol[s]["change_pct"],
+            "closes":     by_symbol[s]["closes"],
+        }
+        for s in requested
+        if s in by_symbol
+    ]
+    return {"quotes": quotes}
+
+
 def _to_utc_dt(value) -> datetime | None:
     """Coerce a yfinance metadata timestamp (epoch number, datetime, or
     pandas Timestamp) into a tz-aware UTC datetime. Returns None for NaT or
