@@ -84,6 +84,41 @@ behaviors worth knowing:
   touched, so a leaked token can't be used to spam Yahoo with garbage
   tickers and grow the in-memory cache without bound.
 
+### `GET /stocks?symbols=…` — batch quotes
+
+One request for a whole watchlist instead of one `/stock/{symbol}` call per
+symbol. Built for the STM32 ticker: fanning out N calls per refresh tied up
+its single keep-alive connection, so history taps queued behind quote
+fetches. `GET /stocks?symbols=AMD,NVDA,AAPL` →
+`{"quotes": [{"symbol","last","change_pct","closes"}, …]}`.
+
+- Entries carry **exactly** the field names/types of `/stock/{symbol}`
+  (`symbol`, `last`, `change_pct`, 5-point `closes`) and nothing else — the
+  firmware's cJSON parser reads them verbatim, and dropping `prev`/`change`/
+  `cached`/`stale` keeps the response inside the device's 24 KB buffer
+  (~1.5 KB for 16 symbols, compact `JSONResponse` with `Content-Length`).
+- **Omission, not failure** — unknown/allowlist-rejected symbols and ones
+  with no data are dropped from `quotes`; one bad ticker never fails the
+  whole request. The client must key results by each entry's `symbol`, not
+  by request index (order is preserved, but entries can be missing).
+- Capped at 16 (`STOCKS_MAX_SYMBOLS`); more → 400, empty → 400.
+- Shares the quote cache + poller below; every requested symbol is marked
+  active, and cache misses are resolved in **one** `_fetch_batch` Yahoo
+  round-trip, not N.
+
+### Live-quote cache & background poller
+
+Distinct from the Postgres minute-bar history further down. Live quotes sit
+in an in-memory dict `_cache[symbol] = {ts, data}` with a 10-min TTL
+(`CACHE_TTL_SECONDS`); on a miss the single endpoint fetches one symbol and
+the batch endpoint fetches all misses in one `_fetch_batch` call. A
+background task (`_quote_poll_loop`) refreshes the **active working set** —
+every symbol requested via `/stock` or `/stocks` within `QUOTE_ACTIVE_WINDOW`
+(15 min), capped at `QUOTE_MAX_ACTIVE` — every `QUOTE_POLL_SECONDS` (60 s
+open / 300 s closed) in batches of `QUOTE_BATCH_SIZE`. Net effect: upstream
+Yahoo load scales with the number of *distinct symbols*, not with the number
+of devices or requests, so adding clients on the same watchlist is free.
+
 ### `GET /history/{symbol}` — two modes
 
 The endpoint serves two distinct data sources behind one URL. The decision
@@ -119,26 +154,32 @@ to `range=` and `days=N` is removed.
 
 ### `GET /logo/{symbol}` and `GET /logos`
 
-Serves a 64x64 PNG per ticker, cached on disk under `LOGO_CACHE_DIR`.
-Resolution order is `logo_sources.json` override → ticker domain → public
-favicon/logo sources (Clearbit, Google s2). Misses are remembered in a
-`{SYM}.miss.json` marker with a 24 h TTL to avoid hammering upstreams for
-tickers that have no findable logo. `/logos?symbols=A,B,C` is the manifest
-endpoint — returns one URL + cache-status entry per symbol, no images.
-Normalization is applied only when a logo is first fetched; if the crop/
-resize logic changes, delete existing cached `*.png` files and pre-warm
-again so old padded images are not served forever.
+Serves a transparent RGBA PNG per ticker, cached on disk under
+`LOGO_CACHE_DIR`. Resolution order is: `logo_sources.json` override →
+Brandfetch Logo Link `symbol` (high-res, transparent; only if
+`BRANDFETCH_CLIENT_ID` is set, with its "B" placeholder rejected by sha256
+and opaque assets skipped) → the larger of the DuckDuckGo ip3 / Google s2
+favicons → a generated **monogram** tile when nothing usable resolves
+(source below `LOGO_MIN_NATIVE`, 32 px). The chosen source is stored as a
+high-res **master** `{SYM}.png` (native resolution capped at 256 px,
+alpha-trimmed). Total misses are remembered in a `{SYM}.miss.json` marker
+(24 h TTL) and return 404. `logo_sources.json` values may be full URLs or
+repo-relative paths to committed assets (e.g. `logo_overrides/NVDA.png`,
+how `NVDA` is pinned to a clean mark). `/logos?symbols=A,B,C` is the
+manifest endpoint — one URL + cache-status entry per symbol, no images.
+If the resolver/resize logic changes, delete cached `*.png` and let them
+rebuild (or pre-warm) so stale masters aren't served forever.
 
 **`?size=` query parameter** — accepts `{32, 48, 64}`, default `64`,
-anything else 400s. `size=64` returns the cached file via FileResponse
-byte-identical to the no-arg path, so existing clients are unaffected.
-`size=32` and `size=48` open the cached 64×64 PNG with Pillow and
-resize via LANCZOS preserving RGBA, served with the same long-cache
-headers. Driven by the ESP32 CYD firmware: lodepng peaks ~60 KB
-transient for a 64×64 RGBA decode, but the largest contiguous heap
-block after WiFi+TLS is ~40 KB — so the device requests `?size=48`.
-Resizing on read (not write) keeps the on-disk cache as the highest-
-fidelity copy and avoids fanning out the cache directory per size.
+anything else 400s. Every size is derived from the high-res master in a
+single premultiplied-alpha LANCZOS downscale (premultiply avoids dark
+halos on transparent edges), centered on a transparent square at
+`LOGO_CONTENT_RATIO` fill, and cached per size as `{SYM}.{size}.png`.
+Because the master is now high-res (≤256 px) rather than 64×64, `size=64`
+is a derived render too — no longer byte-identical to the master file.
+Driven by the ESP32 CYD firmware: lodepng peaks ~60 KB transient for a
+64×64 RGBA decode, but the largest contiguous heap block after WiFi+TLS
+is ~40 KB — so the device requests `?size=48`; sizes never exceed 64 px.
 
 **`?test=1` diagnostic mode** — `GET /logo/{symbol}?test=1` (or env
 `STOCK_API_LOGO_TEST=1`) skips the resolver and the cache and returns a
@@ -155,7 +196,10 @@ in production traffic.
 No auth. Exposes:
 - `universe_size`, `universe_refreshed_at` — symbol allowlist state
 - `cached_symbols` — what's currently in the live-quote cache
-- `history_enabled`, `hot_symbols`, `hot_max`, `tick_seconds`
+- `history_enabled`, `hot_symbols`, `hot_max`, `tick_seconds` — Postgres
+  minute-bar history state
+- `active_symbols`, `quote_poll_seconds`, `quote_poll_at`, `quote_poll_ok`
+  — live-quote poller state (working-set size + last run)
 - `market_open` — am I currently in US RTH?
 
 ### `GET /docs`
