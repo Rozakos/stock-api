@@ -114,10 +114,22 @@ in an in-memory dict `_cache[symbol] = {ts, data}` with a 10-min TTL
 the batch endpoint fetches all misses in one `_fetch_batch` call. A
 background task (`_quote_poll_loop`) refreshes the **active working set** —
 every symbol requested via `/stock` or `/stocks` within `QUOTE_ACTIVE_WINDOW`
-(15 min), capped at `QUOTE_MAX_ACTIVE` — every `QUOTE_POLL_SECONDS` (60 s
-open / 300 s closed) in batches of `QUOTE_BATCH_SIZE`. Net effect: upstream
-Yahoo load scales with the number of *distinct symbols*, not with the number
-of devices or requests, so adding clients on the same watchlist is free.
+(15 min), capped at `QUOTE_MAX_ACTIVE` — every `QUOTE_POLL_SECONDS` in
+batches of `QUOTE_BATCH_SIZE`. Fast cadence runs through the **extended
+session** (`_is_extended_open()`, 04:00–20:00 ET pre+regular+post), dropping
+to `QUOTE_POLL_CLOSED_SECONDS` overnight/weekends. Net effect: upstream Yahoo
+load scales with the number of *distinct symbols*, not with the number of
+devices or requests, so adding clients on the same watchlist is free.
+
+**Extended-hours fields.** Every quote (both endpoints) also carries
+`market_state` ∈ {PRE, REGULAR, POST, CLOSED} (coarse, from `_market_state()`
+on the US-market clock — no holiday/half-day awareness) plus `pre_market` /
+`post_market` and their `*_change_pct` vs the regular close (`last`).
+`last`/`change_pct`/`closes` stay regular-session values; the extended price
+is the close of the last bar from a batched prepost intraday pull
+(`_extended_prices`), attached by `_attach_extended`. Populated only off-hours
+(`pre_market` during PRE; `post_market` during POST/CLOSED); during REGULAR
+both are null and the upstream prepost call is skipped entirely.
 
 ### `GET /history/{symbol}` — two modes
 

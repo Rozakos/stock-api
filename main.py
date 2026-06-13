@@ -211,6 +211,33 @@ def _is_market_open(now_utc: datetime | None = None) -> bool:
     return 9 * 60 + 30 <= minutes < 16 * 60
 
 
+def _market_state(now_utc: datetime | None = None) -> str:
+    """Coarse US-equities session label from the wall clock: PRE (04:00–09:30
+    ET), REGULAR (09:30–16:00), POST (16:00–20:00), else CLOSED. Approximate —
+    it doesn't know holidays/half-days, so it's used only to label quotes and
+    decide whether to look for an extended-hours price, never to gate data."""
+    now = (now_utc or datetime.now(tz=timezone.utc)).astimezone(MARKET_TZ)
+    if now.weekday() >= 5:
+        return "CLOSED"
+    minutes = now.hour * 60 + now.minute
+    if minutes < 4 * 60:
+        return "CLOSED"
+    if minutes < 9 * 60 + 30:
+        return "PRE"
+    if minutes < 16 * 60:
+        return "REGULAR"
+    if minutes < 20 * 60:
+        return "POST"
+    return "CLOSED"
+
+
+def _is_extended_open(now_utc: datetime | None = None) -> bool:
+    """True during the whole extended session (pre + regular + post,
+    04:00–20:00 ET on weekdays) — when prices still move and the poller should
+    keep refreshing at the fast cadence."""
+    return _market_state(now_utc) in ("PRE", "REGULAR", "POST")
+
+
 def _init_db() -> None:
     assert _pool is not None
     with _pool.connection() as conn, conn.cursor() as cur:
@@ -407,7 +434,9 @@ def _fetch(symbol: str) -> dict:
     hist = yf.Ticker(symbol).history(period="5d", interval="1d")
     if hist.empty:
         raise ValueError(f"no data returned for {symbol}")
-    return _build_quote(symbol, list(hist["Close"]))
+    quote = _build_quote(symbol, list(hist["Close"]))
+    _attach_extended({symbol: quote})
+    return quote
 
 
 def _fetch_batch(symbols: list[str]) -> dict[str, dict]:
@@ -435,7 +464,71 @@ def _fetch_batch(symbols: list[str]) -> dict[str, dict]:
             out[sym] = _build_quote(sym, closes)
         except Exception:
             continue
+    _attach_extended(out)
     return out
+
+
+# Extended-hours fields added to every quote. last/change_pct/closes stay the
+# regular-session values; these are additive.
+_EXTENDED_FIELDS = (
+    "market_state", "pre_market", "pre_market_change_pct",
+    "post_market", "post_market_change_pct",
+)
+
+
+def _extended_prices(symbols: list[str]) -> dict[str, float]:
+    """Latest pre/post-market price per symbol = the close of the last bar
+    from a single batched prepost intraday download. One Yahoo round-trip for
+    the whole batch; best-effort (missing symbols simply absent)."""
+    if not symbols:
+        return {}
+    try:
+        df = yf.download(
+            symbols,
+            period="1d",
+            interval="5m",
+            prepost=True,
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception:
+        return {}
+    out: dict[str, float] = {}
+    for sym in symbols:
+        try:
+            closes = df[sym]["Close"].dropna()
+            if len(closes):
+                out[sym] = round(float(closes.iloc[-1]), 4)
+        except Exception:
+            continue
+    return out
+
+
+def _attach_extended(quotes: dict[str, dict]) -> None:
+    """Add market_state + pre/post-market last & change_pct to each quote
+    (in place). During REGULAR hours there's no extended price to show, so we
+    skip the upstream call entirely and just stamp the state. The extended
+    price is compared against `last` (the most recent regular close)."""
+    state = _market_state()
+    for data in quotes.values():
+        data["market_state"] = state
+        data["pre_market"] = data["pre_market_change_pct"] = None
+        data["post_market"] = data["post_market_change_pct"] = None
+    if state == "REGULAR" or not quotes:
+        return
+    prices = _extended_prices(list(quotes))
+    for sym, data in quotes.items():
+        price = prices.get(sym)
+        ref = data.get("last")
+        if not price or not ref:
+            continue
+        pct = round((price - ref) / ref * 100, 4)
+        if state == "PRE":
+            data["pre_market"], data["pre_market_change_pct"] = price, pct
+        else:  # POST / CLOSED -> last available post-market print
+            data["post_market"], data["post_market_change_pct"] = price, pct
 
 
 def _mark_active(symbol: str) -> None:
@@ -480,7 +573,7 @@ async def _quote_poll_loop() -> None:
             await asyncio.to_thread(_poll_quotes_sync)
         except Exception:
             pass
-        delay = QUOTE_POLL_SECONDS if _is_market_open() else QUOTE_POLL_CLOSED_SECONDS
+        delay = QUOTE_POLL_SECONDS if _is_extended_open() else QUOTE_POLL_CLOSED_SECONDS
         await asyncio.sleep(delay)
 
 
@@ -899,6 +992,7 @@ def get_stocks(
             "last":       by_symbol[s]["last"],
             "change_pct": by_symbol[s]["change_pct"],
             "closes":     by_symbol[s]["closes"],
+            **{k: by_symbol[s].get(k) for k in _EXTENDED_FIELDS},
         }
         for s in requested
         if s in by_symbol

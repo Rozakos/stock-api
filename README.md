@@ -19,8 +19,9 @@ ESP8266 ──HTTPS──▶ Cloudflare ──tunnel──▶ stock-api (FastAPI
 - **Live cache** — 10-minute in-memory cache. On yfinance failure, falls back
   to stale cache rather than 502'ing, so the device never blanks out.
 - **Quote poller** — a background task refreshes the *active working set*
-  (every symbol requested in the last 15 min) in batches, once a minute while
-  the market is open. Device `/stock` requests serve from the cache the poller
+  (every symbol requested in the last 15 min) in batches, once a minute
+  through the extended session (pre + regular + post, 04:00–20:00 ET). Device
+  `/stock` requests serve from the cache the poller
   fills, so upstream Yahoo load is bounded by the number of distinct symbols,
   not the number of devices — 500 devices on 500 symbols is ~5 Yahoo requests
   per minute, the same as 50,000 devices would be. See [Scaling](#scaling).
@@ -50,14 +51,30 @@ non-empty UA.
   "prev": 153.44,
   "change": 1.76,
   "change_pct": 1.15,
+  "market_state": "POST",
+  "pre_market": null,
+  "pre_market_change_pct": null,
+  "post_market": 156.40,
+  "post_market_change_pct": 0.77,
   "cached": false,
   "stale": false
 }
 ```
 
-`closes` is oldest→newest, length ≤ 5, no nulls. `cached`/`stale` are debug
-flags (`stale: true` means the upstream failed and we served the last good
+`closes` is oldest→newest, length ≤ 5, no nulls. `last`/`change_pct` are
+always the **regular-session** values. `cached`/`stale` are debug flags
+(`stale: true` means the upstream failed and we served the last good
 response).
+
+**Extended hours.** `market_state` ∈ {`PRE`, `REGULAR`, `POST`, `CLOSED`}
+(coarse, from the US-market clock — doesn't know holidays/half-days).
+`pre_market`/`post_market` carry the latest extended-hours price and its
+`change_pct` **vs the regular close** (`last`), or `null` when not
+applicable: `pre_market` is set only during `PRE`, `post_market` during
+`POST`/`CLOSED` (the last after-hours print of the most recent session).
+During `REGULAR` both are `null` — the live price is already in `last`.
+Sourced from a batched prepost intraday pull, so it's additive and never
+changes the existing fields.
 
 Status codes: `400` unknown symbol, `401` bad/missing bearer, `502` upstream
 Yahoo failure with no prior cache.
@@ -75,10 +92,12 @@ keeping the keep-alive connection free for history taps.
 ]}
 ```
 
-- Each entry carries the same field names/types as `/stock/{symbol}`:
-  `symbol`, `last`, `change_pct`, and the 5-point `closes` sparkline
-  (oldest→newest). No `cached`/`stale`/`prev`/`change` — kept minimal for
-  embedded buffers.
+- Each entry carries the same quote field names/types as `/stock/{symbol}`:
+  `symbol`, `last`, `change_pct`, the 5-point `closes` sparkline
+  (oldest→newest), plus the extended-hours fields `market_state`,
+  `pre_market`, `pre_market_change_pct`, `post_market`,
+  `post_market_change_pct` (see `/stock` above). No `cached`/`stale`/`prev`/
+  `change` — kept minimal for embedded buffers (~3 KB for 16 symbols).
 - Served from the **same cache + background poller** as `/stock/{symbol}`;
   every requested symbol joins the poller's active working set. Cache misses
   are fetched in **one** batched Yahoo round-trip.
@@ -335,7 +354,7 @@ If you're fronting with nginx instead, see `nginx.conf.snippet`.
 | `HISTORY_TICK_SECONDS` | 60 | How often to record minute bars. |
 | `HISTORY_RETENTION_DAYS` | 30 | Older rows are pruned on each tick. |
 | `HISTORY_MAX_HOT` | 8 | LRU cap on archived symbols. Hitting `/stock/{X}` bumps `X` to the front; oldest is evicted when full. |
-| `QUOTE_POLL_SECONDS` | 60 | How often the quote poller refreshes the active set while the market is open. |
+| `QUOTE_POLL_SECONDS` | 60 | How often the quote poller refreshes the active set during the extended session (04:00–20:00 ET). |
 | `QUOTE_POLL_CLOSED_SECONDS` | 300 | Poll interval while the market is closed. |
 | `QUOTE_ACTIVE_WINDOW_SECONDS` | 900 | A symbol stays in the poller's working set this long after it was last requested. |
 | `QUOTE_MAX_ACTIVE` | 1000 | Cap on the working set. The most recently requested symbols win; the rest fall back to on-demand fetch. |

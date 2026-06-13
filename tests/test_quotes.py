@@ -105,8 +105,12 @@ def test_stocks_batch_basic_shape_and_order(monkeypatch):
     body = r.json()
     assert [q["symbol"] for q in body["quotes"]] == ["AMD", "NVDA"]  # order preserved
     q = body["quotes"][0]
-    # exactly the four fields the firmware parser expects, same types
-    assert set(q.keys()) == {"symbol", "last", "change_pct", "closes"}
+    # the four core fields + the additive extended-hours fields
+    assert set(q.keys()) == {
+        "symbol", "last", "change_pct", "closes",
+        "market_state", "pre_market", "pre_market_change_pct",
+        "post_market", "post_market_change_pct",
+    }
     assert q["last"] == 5.0 and q["change_pct"] == 25.0
     assert q["closes"] == [1.0, 2.0, 3.0, 4.0, 5.0] and len(q["closes"]) == 5
     # compact JSON + Content-Length, no chunked streaming
@@ -181,3 +185,68 @@ def test_single_stock_endpoint_unchanged(monkeypatch):
     body = r.json()
     assert body["symbol"] == "AMD" and body["cached"] is False and body["stale"] is False
     assert {"symbol", "closes", "last", "prev", "change", "change_pct"} <= set(body)
+
+
+# --- extended hours (market_state + pre/post-market) -----------------------
+
+from datetime import timezone
+
+
+def test_market_state_windows():
+    # 2026-06-15 is a Monday; June -> EDT (UTC-4)
+    def st(h, m=0, day=15):
+        return main._market_state(datetime(2026, 6, day, h, m, tzinfo=timezone.utc))
+    assert st(12) == "PRE"        # 08:00 ET
+    assert st(14) == "REGULAR"    # 10:00 ET
+    assert st(21) == "POST"       # 17:00 ET
+    assert st(6) == "CLOSED"      # 02:00 ET
+    assert st(14, day=13) == "CLOSED"  # Saturday
+
+
+def test_is_extended_open_tracks_state(monkeypatch):
+    for state, expected in [("PRE", True), ("REGULAR", True), ("POST", True), ("CLOSED", False)]:
+        monkeypatch.setattr(main, "_market_state", lambda *a, **k: state)
+        assert main._is_extended_open() is expected
+
+
+def test_attach_extended_post(monkeypatch):
+    monkeypatch.setattr(main, "_market_state", lambda *a, **k: "POST")
+    monkeypatch.setattr(main, "_extended_prices", lambda syms: {"AMD": 110.0})
+    q = {"AMD": {"symbol": "AMD", "last": 100.0}}
+    main._attach_extended(q)
+    d = q["AMD"]
+    assert d["market_state"] == "POST"
+    assert d["post_market"] == 110.0 and d["post_market_change_pct"] == 10.0
+    assert d["pre_market"] is None and d["pre_market_change_pct"] is None
+
+
+def test_attach_extended_pre(monkeypatch):
+    monkeypatch.setattr(main, "_market_state", lambda *a, **k: "PRE")
+    monkeypatch.setattr(main, "_extended_prices", lambda syms: {"AMD": 90.0})
+    q = {"AMD": {"symbol": "AMD", "last": 100.0}}
+    main._attach_extended(q)
+    d = q["AMD"]
+    assert d["pre_market"] == 90.0 and d["pre_market_change_pct"] == -10.0
+    assert d["post_market"] is None
+
+
+def test_attach_extended_closed_uses_post(monkeypatch):
+    monkeypatch.setattr(main, "_market_state", lambda *a, **k: "CLOSED")
+    monkeypatch.setattr(main, "_extended_prices", lambda syms: {"AMD": 105.0})
+    q = {"AMD": {"symbol": "AMD", "last": 100.0}}
+    main._attach_extended(q)
+    assert q["AMD"]["post_market"] == 105.0 and q["AMD"]["post_market_change_pct"] == 5.0
+
+
+def test_attach_extended_regular_skips_upstream(monkeypatch):
+    monkeypatch.setattr(main, "_market_state", lambda *a, **k: "REGULAR")
+
+    def boom(syms):
+        raise AssertionError("no extended fetch during REGULAR hours")
+
+    monkeypatch.setattr(main, "_extended_prices", boom)
+    q = {"AMD": {"symbol": "AMD", "last": 100.0}}
+    main._attach_extended(q)
+    d = q["AMD"]
+    assert d["market_state"] == "REGULAR"
+    assert d["pre_market"] is None and d["post_market"] is None
