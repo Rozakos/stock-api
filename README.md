@@ -28,6 +28,11 @@ ESP8266 ──HTTPS──▶ Cloudflare ──tunnel──▶ stock-api (FastAPI
 - **1-minute history** — for the 8 most-recently-requested symbols (LRU),
   one row per minute bar is written to Postgres during US regular trading
   hours, retained 30 days. Queryable via `GET /history/{symbol}?days=N`.
+- **Crypto** — symbols with a `-USD` suffix (`BTC-USD`, `ETH-USD`, `SOL-USD`,
+  …) route to **CoinGecko** instead of yfinance, end-to-end: quotes, history,
+  and logos (Yahoo has no crypto icons). 24/7, with true rolling-24h change.
+  Equities are untouched. Works keyless; set `COINGECKO_API_KEY` for higher
+  rate limits. See [Crypto](#crypto).
 - **Range history** — `GET /history/{symbol}?range=…` returns longer windows
   (up to `max`) fetched live from yfinance at fixed period+interval pairs,
   server-cached with TTLs tuned per range. An optional `&limit=N` downsamples
@@ -363,6 +368,7 @@ If you're fronting with nginx instead, see `nginx.conf.snippet`.
 | `LOGO_OVERRIDES_FILE` | `logo_sources.json` | JSON map of `TICKER -> logo URL` to override the auto-resolution chain. |
 | `LOGO_MIN_NATIVE` | 32 | If the best resolved logo's native max-dimension is below this, serve a generated monogram instead. |
 | `BRANDFETCH_CLIENT_ID` | (empty) | Brandfetch Logo Link client ID. If set, the transparent high-res Brandfetch symbol is used as a logo source ahead of the favicon fallbacks. |
+| `COINGECKO_API_KEY` | (empty) | CoinGecko Demo API key for crypto (`-USD`) quotes/history/logos. Optional — crypto works keyless but the free tier is heavily rate-limited; a key raises the limit. |
 
 The on-disk file `symbols.cache.json` stores the last fetched symbol universe
 so restarts don't depend on the network. It's gitignored and self-heals on
@@ -388,6 +394,33 @@ User-Agent, calls the API, renders the same fields the OLED draws.
 - Restart: `sudo systemctl restart stock-api`
 - DB: rows live in `prices(symbol TEXT, ts TIMESTAMPTZ, last DOUBLE PRECISION)`
   with a `(symbol, ts DESC)` index. Created on first startup.
+
+## Crypto
+
+Symbols with a `-USD` suffix (`BTC-USD`, `ETH-USD`, `SOL-USD`, …) are routed
+to **CoinGecko** instead of yfinance, across all three data endpoints. No US
+equity/ETF ticker uses `-USD`, so the suffix is the router (`_is_crypto`), and
+crypto symbols bypass the NASDAQ allowlist (CoinGecko validates them — an
+unknown coin just returns no data). The client and response shapes are
+identical to equities, so **the device needs no changes**.
+
+- **Quotes** (`/stock`, `/stocks`) — one batched `/coins/markets` call yields
+  price, true rolling-**24h** change (`change_pct`), a 5-point `closes`
+  sparkline, and the coin's logo URL. Crypto is always `market_state:
+  "REGULAR"` with `pre_market`/`post_market` null (it trades 24/7). Shared
+  symbols are disambiguated by market-cap rank.
+- **History** (`/history?range=…`) — `/coins/{id}/market_chart`. No
+  `session_open`/`session_close` (24/7). **The free/Demo tier caps history at
+  365 days**, so `5y`/`max` are clamped to a year. `&limit=N` downsampling
+  still applies.
+- **Logos** (`/logo`) — the CoinGecko coin image (a transparent ~250px mark)
+  feeds the same high-res-master pipeline; a manual override still wins, and a
+  miss falls back to a monogram. This is the gap Yahoo can't fill.
+
+Set `COINGECKO_API_KEY` (free Demo key) for higher rate limits; it works
+keyless otherwise, but the public tier is tight and rate-limited crypto
+requests degrade gracefully (omitted quote / empty history / monogram), never
+a 5xx.
 
 ## Scaling
 

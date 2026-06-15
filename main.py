@@ -394,7 +394,171 @@ def _auth(authorization: str):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+# --- CoinGecko: crypto quotes, history, and logos -------------------------
+# Equities stay on yfinance; symbols with a Yahoo-style `-USD` suffix
+# (BTC-USD, ETH-USD, …) route here. CoinGecko is crypto-native: one
+# /coins/markets call yields price + true rolling-24h change + a sparkline +
+# the coin's logo URL, and /coins/{id}/market_chart gives history — 24/7, and
+# it's the one source that has crypto icons (Yahoo doesn't).
+COINGECKO_BASE = os.getenv("COINGECKO_BASE", "https://api.coingecko.com/api/v3")
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")  # optional free Demo key
+# CoinGecko's free/Demo tier caps market_chart history at 365 days (error
+# 10012 beyond that), so 5y/max are clamped to a year — the most the tier
+# allows. Equities (yfinance) are unaffected.
+CRYPTO_RANGE_DAYS = {
+    "1d": "1", "1w": "7", "1mo": "30", "6mo": "180",
+    "1y": "365", "5y": "365", "max": "365",
+}
+_crypto_ids: dict[str, str] = {}  # coingecko symbol-base -> coin id (cached)
+
+
+def _is_crypto(symbol: str) -> bool:
+    """Route on the Yahoo-style crypto convention: a `-USD` suffix. No US
+    equity/ETF ticker uses it, so it's a safe crypto router."""
+    return symbol.endswith("-USD")
+
+
+def _crypto_base(symbol: str) -> str:
+    return symbol[:-4].lower()  # "BTC-USD" -> "btc"
+
+
+def _coingecko_get(path: str):
+    headers = {"User-Agent": LOGO_USER_AGENT}
+    if COINGECKO_API_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+    req = urllib.request.Request(COINGECKO_BASE + path, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def _round_price(p) -> float:
+    """Round, preserving precision for sub-dollar coins."""
+    p = float(p)
+    return round(p, 4) if abs(p) >= 1 else round(p, 8)
+
+
+def _coingecko_markets(bases: list[str]) -> dict[str, dict]:
+    """One batched /coins/markets call -> {symbol_base: best coin}. Shared
+    symbols are disambiguated by lowest market-cap rank."""
+    if not bases:
+        return {}
+    q = ",".join(sorted(set(bases)))
+    try:
+        data = _coingecko_get(
+            f"/coins/markets?vs_currency=usd&symbols={q}"
+            f"&sparkline=true&price_change_percentage=24h"
+        )
+    except Exception:
+        return {}
+    best: dict[str, tuple[int, dict]] = {}
+    for c in data if isinstance(data, list) else []:
+        sym = (c.get("symbol") or "").lower()
+        rank = c.get("market_cap_rank") or 10**9
+        if sym and (sym not in best or rank < best[sym][0]):
+            best[sym] = (rank, c)
+    return {sym: c for sym, (_, c) in best.items()}
+
+
+def _sample_closes(spark: list, last: float, n: int = 5) -> list:
+    """Down-sample the 7d sparkline to an n-point oldest->newest mini series,
+    mirroring the equity `closes` shape."""
+    vals = [_round_price(p) for p in spark if p is not None]
+    if len(vals) <= 1:
+        return vals or [last]
+    if len(vals) <= n:
+        return vals
+    step = (len(vals) - 1) / (n - 1)
+    idx = sorted({round(i * step) for i in range(n)})
+    return [vals[i] for i in idx]
+
+
+def _build_crypto_quote(symbol: str, c: dict) -> dict | None:
+    price = c.get("current_price")
+    if price is None:
+        return None
+    pct = c.get("price_change_percentage_24h")
+    pct = round(float(pct), 4) if pct is not None else 0.0
+    last = _round_price(price)
+    prev = _round_price(price / (1 + pct / 100)) if (1 + pct / 100) else last
+    spark = (c.get("sparkline_in_7d") or {}).get("price") or []
+    return {
+        "symbol":     symbol,
+        "closes":     _sample_closes(spark, last),
+        "last":       last,
+        "prev":       prev,
+        "change":     _round_price(last - prev),
+        "change_pct": pct,
+        # crypto trades 24/7 — always "open", no pre/post session
+        "market_state":          "REGULAR",
+        "pre_market":            None,
+        "pre_market_change_pct": None,
+        "post_market":           None,
+        "post_market_change_pct": None,
+    }
+
+
+def _fetch_crypto_batch(symbols: list[str]) -> dict[str, dict]:
+    """Crypto quotes in one batched CoinGecko call. Same shape as the equity
+    quote (incl. the extended-hours fields). Missing coins simply absent."""
+    bases = {s: _crypto_base(s) for s in symbols}
+    markets = _coingecko_markets(list(bases.values()))
+    out: dict[str, dict] = {}
+    for s, base in bases.items():
+        c = markets.get(base)
+        if not c:
+            continue
+        if c.get("id"):
+            _crypto_ids.setdefault(base, c["id"])  # cache id for history/logo
+        q = _build_crypto_quote(s, c)
+        if q:
+            out[s] = q
+    return out
+
+
+def _coingecko_id(symbol: str) -> str | None:
+    base = _crypto_base(symbol)
+    if base not in _crypto_ids:
+        m = _coingecko_markets([base])
+        if base in m and m[base].get("id"):
+            _crypto_ids[base] = m[base]["id"]
+    return _crypto_ids.get(base)
+
+
+def _fetch_crypto_range(symbol: str, range_key: str) -> dict:
+    """Crypto history via CoinGecko market_chart. No session bounds (24/7)."""
+    cid = _coingecko_id(symbol)
+    points: list[dict] = []
+    if cid:
+        try:
+            data = _coingecko_get(
+                f"/coins/{cid}/market_chart?vs_currency=usd"
+                f"&days={CRYPTO_RANGE_DAYS[range_key]}"
+            )
+            for ms, price in data.get("prices", []):
+                points.append({"ts": int(ms // 1000), "last": _round_price(price)})
+        except Exception:
+            pass
+    kind = "intraday" if range_key in ("1d", "1w") else "daily"
+    return {
+        "symbol":   symbol,
+        "range":    range_key,
+        "interval": kind,
+        "count":    len(points),
+        "points":   points,
+    }
+
+
+def _coingecko_logo_image(symbol: str):
+    base = _crypto_base(symbol)
+    c = _coingecko_markets([base]).get(base)
+    if not c or not c.get("image"):
+        return None
+    return _fetch_image(c["image"])
+
+
 def _is_allowed(symbol: str) -> bool:
+    if _is_crypto(symbol):
+        return True  # validated downstream by CoinGecko (unknown -> no data)
     if symbol in EXTRA_SYMBOLS:
         return True
     if not _symbols:
@@ -431,6 +595,11 @@ def _build_quote(symbol: str, raw_closes) -> dict:
 
 
 def _fetch(symbol: str) -> dict:
+    if _is_crypto(symbol):
+        quote = _fetch_crypto_batch([symbol]).get(symbol)
+        if quote is None:
+            raise ValueError(f"no data returned for {symbol}")
+        return quote
     hist = yf.Ticker(symbol).history(period="5d", interval="1d")
     if hist.empty:
         raise ValueError(f"no data returned for {symbol}")
@@ -440,31 +609,38 @@ def _fetch(symbol: str) -> dict:
 
 
 def _fetch_batch(symbols: list[str]) -> dict[str, dict]:
-    """Fetch quotes for many symbols in a single Yahoo round-trip (yfinance
-    batches them internally). Returns {symbol: payload} for the symbols that
-    came back with usable data; missing/invalid symbols are simply absent."""
+    """Fetch quotes for many symbols, routing equities to yfinance (one Yahoo
+    round-trip) and crypto (`-USD`) to CoinGecko (one round-trip). Returns
+    {symbol: payload}; missing/invalid symbols are simply absent."""
     if not symbols:
         return {}
-    df = yf.download(
-        symbols,
-        period="5d",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    equity = [s for s in symbols if not _is_crypto(s)]
+    crypto = [s for s in symbols if _is_crypto(s)]
     out: dict[str, dict] = {}
-    for sym in symbols:
-        try:
-            closes = list(df[sym]["Close"])
-        except Exception:
-            continue
-        try:
-            out[sym] = _build_quote(sym, closes)
-        except Exception:
-            continue
-    _attach_extended(out)
+    if equity:
+        df = yf.download(
+            equity,
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        eq: dict[str, dict] = {}
+        for sym in equity:
+            try:
+                closes = list(df[sym]["Close"])
+            except Exception:
+                continue
+            try:
+                eq[sym] = _build_quote(sym, closes)
+            except Exception:
+                continue
+        _attach_extended(eq)
+        out.update(eq)
+    if crypto:
+        out.update(_fetch_crypto_batch(crypto))
     return out
 
 
@@ -773,8 +949,9 @@ def _brandfetch_symbol(domain: str) -> Image.Image | None:
 
 def _best_source_image(symbol: str) -> Image.Image | None:
     """Resolve the best logo we can find, in priority order: manual override,
-    then Brandfetch's transparent symbol, then the largest favicon. Returns
-    None if nothing resolves (caller then renders a monogram)."""
+    then (for crypto) CoinGecko's coin image, then Brandfetch's transparent
+    symbol, then the largest favicon. Returns None if nothing resolves (caller
+    then renders a monogram)."""
     # A manual override is an explicit choice — trust it and skip everything
     # else, including the slow yfinance .info round-trip.
     override = _logo_overrides.get(symbol)
@@ -782,6 +959,10 @@ def _best_source_image(symbol: str) -> Image.Image | None:
         img = _fetch_image(override)
         if img is not None:
             return img
+    # Crypto: Yahoo has no icons; CoinGecko provides a transparent 250px mark.
+    # No favicon domain to fall back to, so it's CoinGecko or a monogram.
+    if _is_crypto(symbol):
+        return _coingecko_logo_image(symbol)
     domain = _ticker_domain(symbol)
     if not domain:
         return None
@@ -1093,6 +1274,8 @@ def _session_bounds_for(ticker, points: list[dict]) -> tuple[int, int] | None:
 
 
 def _fetch_range(symbol: str, range_key: str) -> dict:
+    if _is_crypto(symbol):
+        return _fetch_crypto_range(symbol, range_key)
     period, interval = RANGE_MAP[range_key]
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period=period, interval=interval)

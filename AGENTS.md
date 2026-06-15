@@ -131,6 +131,30 @@ is the close of the last bar from a batched prepost intraday pull
 (`pre_market` during PRE; `post_market` during POST/CLOSED); during REGULAR
 both are null and the upstream prepost call is skipped entirely.
 
+### Crypto (CoinGecko branch)
+
+Symbols ending in `-USD` (`BTC-USD`, `ETH-USD`, …) are crypto and route to
+**CoinGecko** instead of yfinance, across quotes, history, and logos. The
+suffix is the router (`_is_crypto`) — no US equity/ETF uses it — and crypto
+bypasses the NASDAQ allowlist (`_is_allowed` returns True for `-USD`;
+CoinGecko validates downstream, unknown coin → no data). Response/route
+shapes are identical to equities, so the firmware is unchanged.
+
+- **Quotes**: `_fetch_crypto_batch` → one `/coins/markets?symbols=…` call →
+  price, rolling-24h `change_pct`, 5-point `closes` from the sparkline, logo
+  URL. Always `market_state: REGULAR`, pre/post null (24/7). Shared symbols
+  disambiguated by lowest market-cap rank. `_fetch`/`_fetch_batch` split the
+  request: equities → yfinance, crypto → here.
+- **History**: `_fetch_crypto_range` → `/coins/{id}/market_chart`. No session
+  bounds. **Free/Demo tier caps history at 365 days** (error 10012 beyond),
+  so `CRYPTO_RANGE_DAYS` clamps `5y`/`max` to 365.
+- **Logos**: `_coingecko_logo_image` (transparent ~250px) feeds the normal
+  high-res-master pipeline; override still wins, miss → monogram.
+- **Key**: `COINGECKO_API_KEY` (optional Demo key, `x-cg-demo-api-key`
+  header). Works keyless but the public tier is tightly rate-limited; all
+  CoinGecko calls are best-effort and degrade gracefully (omit/empty/monogram,
+  never 5xx). `_crypto_ids` caches symbol→coin-id.
+
 ### `GET /history/{symbol}` — two modes
 
 The endpoint serves two distinct data sources behind one URL. The decision
