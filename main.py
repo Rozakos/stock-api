@@ -7,7 +7,7 @@ import time
 import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Literal
@@ -110,6 +110,12 @@ RANGE_TTL: dict[str, int] = {
     "max": 3600,
 }
 
+# While a session is live (market_state != CLOSED) a 1d prepost payload grows
+# with every new print, so it's cached more briefly than the regular 60 s so
+# progressive charts stay close to real time. Only prepost 1d payloads carry a
+# market_state, so this never shortens the default (prepost-omitted) TTL.
+LIVE_RANGE_TTL = 20
+
 # yfinance interval strings considered intraday (anything finer than 1d)
 _INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
 
@@ -119,8 +125,9 @@ _symbols: set[str] = set()
 _symbols_refreshed_at: datetime | None = None
 _hot: "OrderedDict[str, None]" = OrderedDict()
 _pool: ConnectionPool | None = None
-# { ("AMD","1d"): (fetched_at, payload) }
-_range_cache: dict[tuple[str, str], tuple[datetime, dict]] = {}
+# { ("AMD","1d",False): (fetched_at, payload) } — prepost flag keeps the
+# extended-hours 1d payload from colliding with the regular-session one.
+_range_cache: dict[tuple[str, str, bool], tuple[datetime, dict]] = {}
 
 # { "AMD": last_requested_at } — the quote poller's working set.
 _active: dict[str, datetime] = {}
@@ -1273,12 +1280,63 @@ def _session_bounds_for(ticker, points: list[dict]) -> tuple[int, int] | None:
     return None
 
 
-def _fetch_range(symbol: str, range_key: str) -> dict:
+def _market_tz_and_day(ticker, points: list[dict]) -> tuple[ZoneInfo, date]:
+    """Exchange timezone and the trading day the intraday points cover. Falls
+    back to the current trading period, then to today in the exchange tz, so a
+    day is available even before the first pre-market print lands."""
+    meta = getattr(ticker, "history_metadata", None) or {}
+    tz_name = meta.get("exchangeTimezoneName")
+    try:
+        market_tz = ZoneInfo(tz_name) if tz_name else MARKET_TZ
+    except Exception:
+        market_tz = MARKET_TZ
+
+    if points:
+        day = (
+            datetime.fromtimestamp(points[-1]["ts"], tz=timezone.utc)
+            .astimezone(market_tz)
+            .date()
+        )
+        return market_tz, day
+
+    regular = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+    start = _to_utc_dt(regular.get("start"))
+    if start is not None:
+        return market_tz, start.astimezone(market_tz).date()
+    return market_tz, datetime.now(tz=timezone.utc).astimezone(market_tz).date()
+
+
+def _extended_window_for(ticker, points: list[dict]) -> tuple[int, int]:
+    """Full extended-hours window (04:00–20:00 ET) as (open, close) epoch
+    seconds for the trading day the 1d points cover. Unlike the regular session
+    these are fixed wall-clock bounds, so a progressive chart has a stable
+    x-axis span even during pre-market when only a few prints exist."""
+    market_tz, day = _market_tz_and_day(ticker, points)
+    open_dt = datetime(day.year, day.month, day.day, 4, 0, tzinfo=market_tz)
+    close_dt = datetime(day.year, day.month, day.day, 20, 0, tzinfo=market_tz)
+    return int(open_dt.timestamp()), int(close_dt.timestamp())
+
+
+def _prev_close_from_meta(ticker) -> float | None:
+    """Previous regular session's close, from yfinance chart metadata — lets a
+    1d client color the chart by day-change without a second request. For a 1d
+    chart `chartPreviousClose` is exactly the prior session's close."""
+    meta = getattr(ticker, "history_metadata", None) or {}
+    for key in ("chartPreviousClose", "previousClose"):
+        v = meta.get(key)
+        if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+            return round(float(v), 4)
+    return None
+
+
+def _fetch_range(symbol: str, range_key: str, prepost: bool = False) -> dict:
     if _is_crypto(symbol):
         return _fetch_crypto_range(symbol, range_key)
     period, interval = RANGE_MAP[range_key]
+    # prepost is meaningful only for the intraday 1d chart; ignore it elsewhere.
+    include_prepost = prepost and range_key == "1d"
     ticker = yf.Ticker(symbol)
-    hist = ticker.history(period=period, interval=interval)
+    hist = ticker.history(period=period, interval=interval, prepost=include_prepost)
     points: list[dict] = []
     if not hist.empty:
         for idx, row in hist.iterrows():
@@ -1306,6 +1364,17 @@ def _fetch_range(symbol: str, range_key: str) -> dict:
         bounds = _session_bounds_for(ticker, points)
         if bounds is not None:
             result["session_open"], result["session_close"] = bounds
+        # Extended-hours extras — only when prepost was requested, so the
+        # default 1d payload stays byte-identical. session_open/close above
+        # stay the *regular* bounds; window_open/close below span pre+post so a
+        # client can style the extended segments and place a divider at 09:30.
+        if include_prepost:
+            result["market_state"] = _market_state()
+            result["window_open"], result["window_close"] = \
+                _extended_window_for(ticker, points)
+            prev_close = _prev_close_from_meta(ticker)
+            if prev_close is not None:
+                result["prev_close"] = prev_close
     return result
 
 
@@ -1321,6 +1390,18 @@ def _downsample(points: list, limit: int) -> list:
     step = (n - 1) / (limit - 1)
     indices = sorted({round(i * step) for i in range(limit)})
     return [points[i] for i in indices]
+
+
+def _effective_ttl(range_key: str, data: dict) -> int:
+    """Cache TTL for a range payload. A live 1d prepost payload (market_state
+    present and != CLOSED) is refreshed more often so progressive charts track
+    the session; everything else keeps its static per-range TTL. Default
+    (prepost-omitted) payloads carry no market_state, so they're unaffected."""
+    base = RANGE_TTL[range_key]
+    state = data.get("market_state")
+    if state is not None and state != "CLOSED":
+        return min(base, LIVE_RANGE_TTL)
+    return base
 
 
 def _apply_limit(data: dict, limit: int | None) -> dict:
@@ -1348,6 +1429,12 @@ def get_history(
                               description="Max points to return for range=… ; "
                                           "server downsamples uniformly, keeping "
                                           "the first and last point."),
+    prepost: bool = Query(False,
+                          description="range=1d only: include pre-market (from "
+                                      "04:00 ET) and after-hours (until 20:00 ET) "
+                                      "points, plus window_open/window_close, "
+                                      "market_state and prev_close. Ignored for "
+                                      "other ranges."),
     days: int = Query(7, ge=1, le=HISTORY_RETENTION_DAYS,
                       description="Legacy: minute bars over the last N days from the archive."),
     authorization: str = Header(default=""),
@@ -1358,13 +1445,15 @@ def get_history(
         raise HTTPException(status_code=400, detail=f"unknown symbol: {symbol}")
 
     if range_ is not None:
-        key = (symbol, range_)
+        # prepost matters only for the intraday 1d equities chart.
+        use_prepost = prepost and range_ == "1d" and not _is_crypto(symbol)
+        key = (symbol, range_, use_prepost)
         now = datetime.now(tz=timezone.utc)
         cached = _range_cache.get(key)
-        if cached and (now - cached[0]).total_seconds() < RANGE_TTL[range_]:
+        if cached and (now - cached[0]).total_seconds() < _effective_ttl(range_, cached[1]):
             return _apply_limit(cached[1], limit)
         try:
-            data = _fetch_range(symbol, range_)
+            data = _fetch_range(symbol, range_, prepost=use_prepost)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         _range_cache[key] = (now, data)

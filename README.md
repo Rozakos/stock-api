@@ -168,6 +168,46 @@ can't be determined they're omitted, and the client should fall back to a
 }
 ```
 
+**`&prepost=1`** (optional, `range=1d` only) — extends the `1d` chart to the
+full **extended-hours** window: pre-market (from 04:00 ET), the regular
+session, and after-hours (until 20:00 ET), as available at request time. Same
+`{ts, last}` shape and same downsampling/`limit` behavior as the regular `1d`.
+`points` still contains only elapsed data — during pre-market that's just the
+pre-market prints so far, and the future is never padded. Ignored for every
+other range. Omitting the param leaves the `1d` response byte-for-byte
+identical to the regular-session one above.
+
+When set, the response adds four fields (and keeps `session_open` /
+`session_close` as the **regular** 09:30/16:00 bounds, so a client can style
+the pre/post segments differently and drop a divider at the open):
+
+- `window_open` / `window_close` — epoch seconds for 04:00 / 20:00 ET of that
+  trading day: the full extended-session x-axis span, so a progressive chart
+  has a stable width even when only a few pre-market prints exist. Fixed
+  wall-clock bounds, so unlike `session_*` they don't shrink on half-days.
+- `market_state` — `PRE` / `REGULAR` / `POST` / `CLOSED`.
+- `prev_close` — the previous regular session's close, so a client can color
+  the chart by day-change without a second request.
+
+While `market_state != CLOSED` the payload is cached for a shorter TTL (20 s
+instead of 60 s) so progressive charts track the live session.
+
+```json
+{
+  "symbol": "AMD",
+  "range": "1d",
+  "interval": "intraday",
+  "count": 147,
+  "points": [{"ts": 1783497600, "last": 512.30}, ...],
+  "session_open": 1783517400,
+  "session_close": 1783540800,
+  "market_state": "POST",
+  "window_open": 1783497600,
+  "window_close": 1783555200,
+  "prev_close": 516.11
+}
+```
+
 **`&limit=N`** (optional, `N ≥ 1`, any range) — caps the response at `N`
 points by **uniform downsampling on the server**, always keeping the first
 and last point so the displayed % change stays correct. Without it, `range=max`

@@ -171,10 +171,29 @@ size. Response carries:
 - `interval` ∈ {`intraday`, `daily`} so the client knows whether to label
   the X axis with times or dates without re-deriving from the range.
 - `range` echoed back for debugging.
+- `1d` only: `session_open` / `session_close` — the day's **regular**
+  session bounds (epoch seconds) from yfinance chart metadata, so half-days
+  and holidays use the exchange's real session rather than a hardcoded 16:00.
+  Omitted when they can't be determined.
+
+**`&prepost=1`** (equities `1d` only) — opts the `1d` chart into the full
+extended-hours window (04:00–20:00 ET) via yfinance `prepost=True`
+(`includePrePost`). `points` then span pre-market + regular + after-hours as
+elapsed. Adds `window_open` / `window_close` (fixed 04:00/20:00 ET epoch
+bounds, so a progressive chart has a stable x-axis; `_extended_window_for`),
+`market_state`, and `prev_close` (previous regular close from
+`chartPreviousClose` metadata; `_prev_close_from_meta`). `session_*` stay the
+regular bounds so clients can style the pre/post segments and place a divider
+at the open. Ignored for crypto and every non-`1d` range. Omitting `prepost`
+leaves the response byte-identical to the regular-session `1d`.
 
 Per-range TTLs (`RANGE_TTL`): 60 s for `1d`, 5 min for short intraday
-(`1w`), 1 h for daily/weekly ranges. Cache key is `(symbol, range)`,
-which also means range-mode responses are de-duped across clients.
+(`1w`), 1 h for daily/weekly ranges. A live `1d` prepost payload
+(`market_state != CLOSED`) drops to `LIVE_RANGE_TTL` (20 s) so progressive
+charts track the session; `_effective_ttl` keys off `market_state`, which only
+prepost payloads carry, so default TTLs are untouched. Cache key is
+`(symbol, range, prepost)`, which also means range-mode responses are de-duped
+across clients.
 
 **`?days=N`** — legacy minute-bar query from the Postgres archive. Only
 useful for symbols currently in the hot LRU. `ts` stays ISO 8601, the top-

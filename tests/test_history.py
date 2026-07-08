@@ -51,6 +51,39 @@ def test_history_range(range_value: str, expected_interval: str) -> None:
     assert isinstance(sample["last"], (int, float))
 
 
+def test_history_1d_prepost_extended_fields() -> None:
+    """range=1d&prepost=1 must carry the extended-hours extras and keep
+    session_* as the regular bounds inside the wider window_* span."""
+    r = requests.get(
+        f"{BASE}/history/{SYMBOL}",
+        params={"range": "1d", "prepost": 1},
+        headers=HEADERS,
+        timeout=30,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["range"] == "1d"
+    assert body["market_state"] in {"PRE", "REGULAR", "POST", "CLOSED"}
+    assert isinstance(body["prev_close"], (int, float))
+    # regular session sits inside the extended window
+    assert body["window_open"] <= body["session_open"]
+    assert body["session_close"] <= body["window_close"]
+
+
+def test_history_1d_default_has_no_prepost_fields() -> None:
+    """Omitting prepost must not leak any extended-hours field."""
+    r = requests.get(
+        f"{BASE}/history/{SYMBOL}",
+        params={"range": "1d"},
+        headers=HEADERS,
+        timeout=30,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    for k in ("market_state", "window_open", "window_close", "prev_close"):
+        assert k not in body
+
+
 def test_history_invalid_range() -> None:
     r = requests.get(
         f"{BASE}/history/{SYMBOL}",
