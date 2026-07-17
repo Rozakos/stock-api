@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import time
 import urllib.request
 from collections import OrderedDict
@@ -16,8 +17,9 @@ from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFont
 from psycopg_pool import ConnectionPool
 
@@ -77,6 +79,13 @@ LOGO_FONT_CANDIDATES = (
 # asset; for brands without one Brandfetch returns a fixed "B" placeholder,
 # whose sha256 we reject so it never leaks through.
 BRANDFETCH_CLIENT_ID = os.getenv("BRANDFETCH_CLIENT_ID", "")
+
+# Device-key minting is open (no master key needed to create one), so abuse is
+# bounded by two limits instead: a hard cap on how many keys can be live at once,
+# and a per-IP hourly rate limit on creation. Listing and revoking still require
+# the master API_SECRET, so nobody can enumerate or kill your devices' keys.
+TOKEN_MAX_ACTIVE = int(os.getenv("TOKEN_MAX_ACTIVE", "10"))
+TOKEN_CREATE_PER_IP_HOURLY = int(os.getenv("TOKEN_CREATE_PER_IP_HOURLY", "3"))
 BRANDFETCH_PLACEHOLDER_SHA256 = (
     "077ed4d7a4a1d611c41517cd5b42dda8e9cd5f447de690ccc497dd49f83d5de8"
 )
@@ -261,6 +270,24 @@ def _init_db() -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS prices_symbol_ts_idx ON prices (symbol, ts DESC)"
         )
+        # Per-device API tokens. Only the sha256 of each token is stored; the
+        # plaintext is shown once at creation and is not recoverable. token_prefix
+        # keeps a non-secret hint (e.g. "sk_1a2b3c4d") for identifying rows in the
+        # UI. The master API_SECRET is not stored here — it stays in .env and is
+        # always accepted in addition to these tokens.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id            SERIAL PRIMARY KEY,
+                token_sha256  TEXT        NOT NULL UNIQUE,
+                token_prefix  TEXT        NOT NULL,
+                label         TEXT        NOT NULL DEFAULT '',
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_used_at  TIMESTAMPTZ,
+                revoked_at    TIMESTAMPTZ
+            )
+            """
+        )
 
 
 def _load_hot_from_db() -> "OrderedDict[str, None]":
@@ -396,8 +423,52 @@ async def access_log(request, call_next):
     return response
 
 
+def _bearer(authorization: str) -> str:
+    """Extract the raw token from an `Authorization: Bearer <token>` header."""
+    if authorization.startswith("Bearer "):
+        return authorization[len("Bearer "):].strip()
+    return ""
+
+
+def _valid_db_token(token: str) -> bool:
+    """True if `token` matches a live (non-revoked) row in api_tokens. Also
+    stamps last_used_at so the UI can show when each device last polled. One
+    UPDATE ... RETURNING both checks validity and records use."""
+    if _pool is None or not token:
+        return False
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    try:
+        with _pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE api_tokens SET last_used_at = now() "
+                "WHERE token_sha256 = %s AND revoked_at IS NULL "
+                "RETURNING id",
+                (digest,),
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 def _auth(authorization: str):
-    if API_SECRET and authorization != f"Bearer {API_SECRET}":
+    """Data-access auth. Accepts the master API_SECRET (unchanged, so existing
+    devices keep working) or any live per-device token. When API_SECRET is
+    unset, auth is disabled entirely (unchanged legacy behaviour)."""
+    if not API_SECRET:
+        return
+    token = _bearer(authorization)
+    if token and secrets.compare_digest(token, API_SECRET):
+        return
+    if _valid_db_token(token):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_master(authorization: str):
+    """Admin auth for the token-management endpoints: master API_SECRET only.
+    Per-device tokens can read stock data but cannot mint or revoke tokens."""
+    token = _bearer(authorization)
+    if not API_SECRET or not secrets.compare_digest(token, API_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -1186,6 +1257,119 @@ def get_stocks(
         if s in by_symbol
     ]
     return {"quotes": quotes}
+
+
+# --- Token management -----------------------------------------------------
+# Per-device bearer tokens minted from the rozakos.eu stock-api page. Creating a
+# key is OPEN (no master key) but bounded by TOKEN_MAX_ACTIVE + a per-IP rate
+# limit; listing and revoking require the master API_SECRET. The plaintext token
+# is returned exactly once, at creation; thereafter only its sha256 and a
+# non-secret prefix are kept, so a leak of this table can't recover a usable key.
+class TokenCreate(BaseModel):
+    label: str = ""
+
+
+def _token_store_ready():
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="token store unavailable")
+
+
+def _client_ip(request: Request) -> str:
+    return request.headers.get("cf-connecting-ip") or (
+        request.client.host if request.client else "-"
+    )
+
+
+# In-memory per-IP creation timestamps (single uvicorn worker, so process-local
+# state is enough). ip -> list[epoch_seconds] within the trailing hour.
+_token_create_hits: dict[str, list[float]] = {}
+
+
+def _rate_limit_create(ip: str):
+    now = time.time()
+    hits = [t for t in _token_create_hits.get(ip, []) if now - t < 3600]
+    if len(hits) >= TOKEN_CREATE_PER_IP_HOURLY:
+        raise HTTPException(
+            status_code=429,
+            detail="too many keys created from your network; try again later",
+        )
+    hits.append(now)
+    _token_create_hits[ip] = hits
+
+
+@app.post("/stocks/api/v1/tokens")
+def create_token(body: TokenCreate, request: Request):
+    _token_store_ready()
+    _rate_limit_create(_client_ip(request))
+    token = "sk_" + secrets.token_hex(24)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    prefix = token[:11]  # "sk_" + 8 hex chars — enough to identify a row
+    label = (body.label or "").strip()[:100]
+    # SELECT + INSERT in one transaction so the cap is enforced atomically.
+    with _pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM api_tokens WHERE revoked_at IS NULL")
+        if cur.fetchone()[0] >= TOKEN_MAX_ACTIVE:
+            raise HTTPException(
+                status_code=429,
+                detail=f"key limit reached ({TOKEN_MAX_ACTIVE} active); "
+                "revoke one from the manage panel first",
+            )
+        cur.execute(
+            "INSERT INTO api_tokens (token_sha256, token_prefix, label) "
+            "VALUES (%s, %s, %s) RETURNING id, created_at",
+            (digest, prefix, label),
+        )
+        row = cur.fetchone()
+    return {
+        "id": row[0],
+        "label": label,
+        "prefix": prefix,
+        "created_at": row[1].isoformat(),
+        # Shown once. There is no endpoint that can return this again.
+        "token": token,
+    }
+
+
+@app.get("/stocks/api/v1/tokens")
+def list_tokens(authorization: str = Header(default="")):
+    _require_master(authorization)
+    _token_store_ready()
+    with _pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, label, token_prefix, created_at, last_used_at, revoked_at "
+            "FROM api_tokens ORDER BY created_at DESC"
+        )
+        rows = cur.fetchall()
+    return {
+        "tokens": [
+            {
+                "id": r[0],
+                "label": r[1],
+                "prefix": r[2],
+                "created_at": r[3].isoformat() if r[3] else None,
+                "last_used_at": r[4].isoformat() if r[4] else None,
+                "revoked": r[5] is not None,
+                "revoked_at": r[5].isoformat() if r[5] else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.delete("/stocks/api/v1/tokens/{token_id}")
+def revoke_token(token_id: int, authorization: str = Header(default="")):
+    _require_master(authorization)
+    _token_store_ready()
+    with _pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE api_tokens SET revoked_at = now() "
+            "WHERE id = %s AND revoked_at IS NULL RETURNING id",
+            (token_id,),
+        )
+        found = cur.fetchone()
+    if not found:
+        raise HTTPException(status_code=404, detail="token not found")
+    return {"id": token_id, "revoked": True}
 
 
 def _to_utc_dt(value) -> datetime | None:

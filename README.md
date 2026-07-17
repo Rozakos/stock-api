@@ -46,6 +46,11 @@ Base: `https://rozakos.eu/stocks/api/v1`. All `/stock`, `/stocks`, and
 bot-fight blocks empty/default User-Agents, so clients **must** send a
 non-empty UA.
 
+The bearer can be the master `API_SECRET` **or** any live per-device key minted
+via the token endpoints (see [Device keys](#device-keys)). The master key is
+always accepted, so existing devices keep working; per-device keys can be
+revoked individually without touching the others.
+
 ### `GET /stock/{symbol}`
 
 ```json
@@ -356,6 +361,39 @@ No auth. Useful for uptime checks and seeing service state:
 / `quote_poll_ok` are the timestamp and result of its last run (handy for
 alerting if the poller stalls).
 
+### Device keys
+
+Per-device bearer keys, minted from the rozakos.eu stock-api page and pasted
+into each device's web UI. Backed by an `api_tokens` table (auto-created on
+startup when `DATABASE_URL` is set). Only the **sha256** of each key is stored —
+the plaintext (`sk_…`) is returned exactly once, at creation, and is not
+recoverable. Requires `DATABASE_URL`; without it these endpoints return `503`.
+
+**`POST /tokens`** — mint a key. **Open** (no bearer required), so anyone with
+the page can create one, but bounded so it can't be abused:
+
+- at most `TOKEN_MAX_ACTIVE` keys may be live at once (`429` when full — revoke
+  one first);
+- at most `TOKEN_CREATE_PER_IP_HOURLY` creations per client IP per hour (`429`).
+
+```jsonc
+// POST /tokens   {"label": "living-room ticker"}
+{
+  "id": 7,
+  "label": "living-room ticker",
+  "prefix": "sk_0aadd8a1",   // non-secret hint shown in the manage list
+  "created_at": "2026-07-17T12:17:26.395921+03:00",
+  "token": "sk_0aadd8a1…"    // shown ONCE — paste into the device now
+}
+```
+
+**`GET /tokens`** and **`DELETE /tokens/{id}`** — list and revoke.
+**Master-key only** (`Authorization: Bearer <API_SECRET>`, not per-device keys),
+so nobody can enumerate or kill your devices' keys. `GET` returns each key's
+`prefix`/`label`/`created_at`/`last_used_at`/`revoked` (never the key itself);
+`DELETE` soft-revokes by stamping `revoked_at`, and the key is rejected on its
+next request.
+
 ## Setup
 
 ```bash
@@ -396,6 +434,8 @@ If you're fronting with nginx instead, see `nginx.conf.snippet`.
 | `CACHE_TTL_SECONDS` | 600 | TTL for the live-quote cache. |
 | `EXTRA_SYMBOLS` | (empty) | Comma-separated tickers to allow alongside the universe. Use this for crypto/indices (e.g. `BTC-USD,^GSPC`) until proper sources are added. |
 | `DATABASE_URL` | (empty) | Postgres DSN. If unset, history features are disabled and `/history` returns 503. |
+| `TOKEN_MAX_ACTIVE` | 10 | Max live per-device keys. `POST /tokens` returns 429 when this many are unrevoked. |
+| `TOKEN_CREATE_PER_IP_HOURLY` | 3 | Max `POST /tokens` calls per client IP per hour (429 beyond it). |
 | `HISTORY_TICK_SECONDS` | 60 | How often to record minute bars. |
 | `HISTORY_RETENTION_DAYS` | 30 | Older rows are pruned on each tick. |
 | `HISTORY_MAX_HOT` | 8 | LRU cap on archived symbols. Hitting `/stock/{X}` bumps `X` to the front; oldest is evicted when full. |

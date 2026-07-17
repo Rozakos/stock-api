@@ -257,6 +257,24 @@ No auth. Exposes:
   — live-quote poller state (working-set size + last run)
 - `market_open` — am I currently in US RTH?
 
+### `POST /tokens`, `GET /tokens`, `DELETE /tokens/{id}` — device keys
+
+Per-device bearer keys, minted from the rozakos.eu stock-api page (the
+`TokenManager` client component in the vat-calculator repo) and pasted into each
+device's web UI. Table `api_tokens` (auto-created in `_init_db`) stores only the
+**sha256** of each key plus a non-secret `token_prefix`; the plaintext `sk_…` is
+returned once at creation and never again.
+
+- `_auth()` accepts the master `API_SECRET` **or** any live (non-revoked) key —
+  each authenticated call stamps `last_used_at`. Master key stays valid so
+  existing devices are unaffected.
+- `POST /tokens` is **open** (no bearer) so the public page can mint a key, but
+  bounded: `TOKEN_MAX_ACTIVE` total live keys + `TOKEN_CREATE_PER_IP_HOURLY` per
+  IP (in-memory, single uvicorn worker). Both return 429 when exceeded.
+- `GET`/`DELETE /tokens` require the master key (`_require_master`) so nobody can
+  enumerate or revoke devices. `DELETE` soft-revokes via `revoked_at`.
+- Needs `DATABASE_URL`; without a pool the endpoints return 503.
+
 ### `GET /docs`
 
 FastAPI auto-generated UI. Reachable on 127.0.0.1 only. Cloudflare Tunnel
